@@ -1,10 +1,11 @@
 import requests
 import time
-from core.models import Kline
+from core.models import Kline, Indicator
 from django.db.models import Min, Max, Sum
 from datetime import datetime, timezone
 import pandas as pd
 import threading
+import numpy as np
 
 loaded_symbols = {}
 print(f"✅ [DEBUG] loaded_symbols défini dans utils : {loaded_symbols}")
@@ -89,50 +90,123 @@ def get_historical_klines(symbol, interval, limit=1000):
     else:
         print(f"❌ Erreur API Binance ({interval}) : {response.status_code} - {response.text}")        
     
+def aggregate_higher_timeframe_klines(symbole):
+    print(f"🔄 [DEBUG] Agrégation des Klines supérieures pour {symbole}...")
 
+    intervals = {"3m": 3, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
 
-def aggregate_higher_timeframe_klines(symbol):
-    """
-    Met à jour dynamiquement les Klines supérieures (3m, 5m, 15m, ...) dès qu'une nouvelle 1m arrive.
-    """
-    last_kline = Kline.objects.filter(symbole=symbol, intervalle="1m").order_by("-timestamp").first()
-    if not last_kline:
-        return
+    for interval, factor in intervals.items():
+        print(f"  ➡️ Agrégation pour {interval} (nécessite {factor} bougies 1m)")
 
-    last_timestamp = last_kline.timestamp
+        # Récupérer la dernière bougie 1m en base
+        last_kline_1m = Kline.objects.filter(symbole=symbole, intervalle="1m").order_by("-timestamp").first()
+        if not last_kline_1m:
+            print(f"⚠️ Aucune bougie 1m disponible pour {symbole}, impossible d'agréger {interval}")
+            continue
 
-    for interval, minute_count in INTERVAL_MAPPING.items():
-        aligned_timestamp = last_timestamp - (last_timestamp % (minute_count * 60 * 1000))  # Alignement du timestamp
+        last_timestamp = last_kline_1m.timestamp
 
-        klines = Kline.objects.filter(
-            symbole=symbol, intervalle="1m",
+        # Trouver le timestamp de début du nouvel intervalle
+        aligned_timestamp = last_timestamp - (last_timestamp % (factor * 60 * 1000))
+
+        # Récupérer toutes les bougies 1m qui appartiennent à cet intervalle
+        klines_1m = list(Kline.objects.filter(
+            symbole=symbole,
+            intervalle="1m",
             timestamp__gte=aligned_timestamp
-        ).order_by("timestamp")
+        ).order_by("timestamp"))
 
-        if klines.count() < minute_count:
-            continue  # On attend d'avoir assez de bougies
+        print(f"  🔍 {len(klines_1m)} bougies 1m trouvées pour {interval}")
 
-        open_price = klines.first().open_price
-        high_price = klines.aggregate(Max("high_price"))["high_price__max"]
-        low_price = klines.aggregate(Min("low_price"))["low_price__min"]
-        close_price = klines.last().close_price
-        volume = klines.aggregate(Sum("volume"))["volume__sum"]
+        if len(klines_1m) < factor:
+            print(f"⚠️ Pas assez de bougies 1m alignées pour générer {interval} ({len(klines_1m)} trouvées)")
+            continue
 
-        Kline.objects.update_or_create(
-            symbole=symbol, intervalle=interval, timestamp=aligned_timestamp,
+        open_price = klines_1m[0].open_price
+        close_price = klines_1m[-1].close_price
+        high_price = max(k.high_price for k in klines_1m)
+        low_price = min(k.low_price for k in klines_1m)
+        volume = sum(k.volume for k in klines_1m)
+
+        # Insérer ou mettre à jour la Kline agrégée
+        kline, created = Kline.objects.update_or_create(
+            symbole=symbole,
+            intervalle=interval,
+            timestamp=aligned_timestamp,
             defaults={
                 "open_price": open_price,
                 "high_price": high_price,
                 "low_price": low_price,
                 "close_price": close_price,
-                "volume": volume
+                "volume": volume,
             }
         )
 
-        print(f"[{datetime.fromtimestamp(aligned_timestamp/1000, tz=timezone.utc)}] {symbol} {interval} Kline générée")
-        rsi_value = calculate_rsi(symbol, interval)
-        print(f"RSI {interval} pour {symbol} : {rsi_value}")
+        if created:
+            print(f"✅ Nouvelle Kline {interval} créée pour {symbole} à {aligned_timestamp}")
+        else:
+            print(f"♻️ Kline {interval} mise à jour pour {symbole} à {aligned_timestamp}")
 
+def calculate_indicators(symbol, interval):
+    """
+    Calcule le MACD, RSI et les bandes de Bollinger pour un symbole donné et un intervalle.
+    """
+    print(f"📊 Début du calcul des indicateurs pour {symbol} ({interval})")
+    klines = list(Kline.objects.filter(symbole=symbol, intervalle=interval).order_by("timestamp").values())
+
+    if len(klines) < 50:  # Assurez-vous d'avoir assez de données
+        return None
+
+    df = pd.DataFrame(klines)
+    df["close_price"] = df["close_price"].astype(float)
+
+    # ✅ Calcul du MACD
+    short_ema = df["close_price"].ewm(span=12, adjust=False).mean()
+    long_ema = df["close_price"].ewm(span=26, adjust=False).mean()
+    df["macd"] = short_ema - long_ema
+    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+
+    # ✅ Calcul du RSI
+    delta = df["close_price"].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / loss
+    df["rsi"] = 100 - (100 / (1 + rs))
+
+    # ✅ Calcul du StochRSI
+    min_rsi = df["rsi"].rolling(window=14).min()
+    max_rsi = df["rsi"].rolling(window=14).max()
+    df["stoch_rsi"] = (df["rsi"] - min_rsi) / (max_rsi - min_rsi)
+
+    # ✅ Calcul des Bollinger Bands
+    df["bollinger_middle"] = df["close_price"].rolling(window=20).mean()  # ✅ Ajout de la bande médiane
+    rolling_std = df["close_price"].rolling(window=20).std()
+    df["bollinger_upper"] = df["bollinger_middle"] + (rolling_std * 2)
+    df["bollinger_lower"] = df["bollinger_middle"] - (rolling_std * 2)    
+
+    latest = df.iloc[-1]  # On prend la dernière ligne
+    print(f"📌 Derniers indicateurs pour {symbol} ({interval}):")
+    print(f"  MACD: {latest['macd']:.2f}, MACD Signal: {latest['macd_signal']:.2f}")
+    print(f"  RSI: {latest['rsi']:.2f}")
+    print(f"  Bollinger: {latest['bollinger_lower']:.2f} - {latest['bollinger_upper']:.2f}")
+
+    # ✅ Enregistrement en base
+    Indicator.objects.update_or_create(
+        symbole=symbol,
+        intervalle=interval,
+        timestamp=int(latest["timestamp"]),
+        defaults={
+            "macd": latest["macd"],
+            "macd_signal": latest["macd_signal"],
+            "rsi": latest["rsi"],
+            "stoch_rsi": latest["stoch_rsi"],
+            "bollinger_upper": latest["bollinger_upper"],
+            "bollinger_middle": latest["bollinger_middle"],
+            "bollinger_lower": latest["bollinger_lower"],
+        }
+    )
+
+    return latest
 
 def calculate_rsi(symbol, interval, period=6):
     """

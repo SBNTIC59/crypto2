@@ -4,7 +4,7 @@ import sys
 import os
 import json
 from core.models import Kline
-from core.utils import aggregate_higher_timeframe_klines, loaded_symbols, loaded_symbols_lock
+from core.utils import aggregate_higher_timeframe_klines, loaded_symbols, loaded_symbols_lock, calculate_indicators
 
 from datetime import datetime, timezone
 import django
@@ -76,6 +76,10 @@ def on_message(ws, message):
     print(f"[{datetime.fromtimestamp(timestamp/1000, tz=timezone.utc)}] {symbole} 1m - O:{open_price} H:{high_price} L:{low_price} C:{close_price}")
     # Mettre à jour les Klines supérieures dès la réception de la bougie 1m
     aggregate_higher_timeframe_klines(symbole)
+    for interval in ["1m", "3m", "5m", "15m", "1h", "4h", "1d"]:
+       result = calculate_indicators(symbole, interval)
+       if result:
+            print(f"📊 {symbole} {interval} - MACD: {result['macd']:.2f}, RSI: {result['rsi']:.2f}, Bollinger: [{result['bollinger_lower']:.2f}, {result['bollinger_upper']:.2f}]")
 
 def on_close(ws, close_status_code, close_msg):
     print(f"❌ WebSocket fermé ! Code: {close_status_code}, Message: {close_msg}")
