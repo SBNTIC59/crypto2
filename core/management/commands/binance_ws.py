@@ -3,8 +3,8 @@ import websocket
 import sys
 import os
 import json
-from core.models import Kline
-from core.utils import aggregate_higher_timeframe_klines, loaded_symbols, loaded_symbols_lock, calculate_indicators
+from core.models import Kline, SymbolStrategy
+from core.utils import aggregate_higher_timeframe_klines, loaded_symbols, loaded_symbols_lock, calculate_indicators, execute_strategies
 
 from datetime import datetime, timezone
 import django
@@ -35,11 +35,13 @@ def on_message(ws, message):
     kline = data.get("k", {})
     #print(f"kline = {kline}")
     symbole = kline["s"]
+    close_price = float(kline["c"])
     #print(f"Symbole{symbole}")
     #if 'loaded_symbols' not in globals():
     #    print("❌ [ERREUR] loaded_symbols n'existe pas dans les variables globales !")
     #    return
-    
+    SymbolStrategy.objects.filter(symbole=symbole).update(close_price=close_price)
+    print(f"📊 {symbole} - Dernier prix mis à jour : {close_price}")
     #try:
     #    print(f"📜 loaded_symbols AVANT vérification et sans verrou dans on_message: {loaded_symbols}")
     #except Exception as e:
@@ -80,6 +82,7 @@ def on_message(ws, message):
        result = calculate_indicators(symbole, interval)
        if result:
             print(f"📊 {symbole} {interval} - MACD: {result['macd']:.2f}, RSI: {result['rsi']:.2f}, Bollinger: [{result['bollinger_lower']:.2f}, {result['bollinger_upper']:.2f}]")
+    execute_strategies(symbole)
 
 def on_close(ws, close_status_code, close_msg):
     print(f"❌ WebSocket fermé ! Code: {close_status_code}, Message: {close_msg}")

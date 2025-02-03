@@ -1,11 +1,20 @@
 import requests
 import time
-from core.models import Kline, Indicator
-from django.db.models import Min, Max, Sum
+from core.models import Kline, Indicator, Indicator, SymbolStrategy, TradeLog
+from django.db.models import Min, Max, Sum, Avg, Count
 from datetime import datetime, timezone
 import pandas as pd
 import threading
 import numpy as np
+import operator
+
+OPERATORS = {
+    "<": operator.lt,
+    "<=": operator.le,
+    ">": operator.gt,
+    ">=": operator.ge,
+    "==": operator.eq
+}
 
 loaded_symbols = {}
 print(f"✅ [DEBUG] loaded_symbols défini dans utils : {loaded_symbols}")
@@ -53,42 +62,51 @@ def load_historical_klines():
         print(f"🔄 Chargement des Klines pour {symbol}...")
         get_historical_klines(symbol, "1m")
 
-def get_historical_klines(symbol, interval, limit=1000):
-    """
-    Récupère l'historique des Klines pour une paire donnée.
-    """
+def get_historical_klines(symbol, interval, limit=5000):
     global loaded_symbols
-    klines_to_insert = [] 
-    url = f"{BINANCE_BASE_URL_klines}?symbol={symbol}&interval={interval}&limit={limit}"
-    response = requests.get(url)
-    
-    if response.status_code == 200:
+
+    print(f"🔄 Chargement de l'historique ({limit} Klines) pour {symbol}...")
+
+    all_klines = []
+    last_timestamp = None
+
+    while len(all_klines) < limit:
+        request_limit = min(1000, limit - len(all_klines))  # Ne pas dépasser `limit`
+        url = f"{BINANCE_BASE_URL}?symbol={symbol}&interval={interval}&limit={request_limit}"
+        
+        if last_timestamp:
+            url += f"&endTime={last_timestamp}"  # Charger des Klines plus anciennes
+
+        response = requests.get(url)
+        if response.status_code != 200:
+            print(f"❌ Erreur API Binance : {response.status_code} - {response.text}")
+            break
+
         data = response.json()
-        for kline in data:
-            klines_to_insert.append(Kline(
-                symbole=symbol,
-                intervalle=interval,
-                timestamp=kline[0],
-                open_price =float(kline[1]),
-                high_price= float(kline[2]),
-                low_price= float(kline[3]),
-                close_price= float(kline[4]),
-                volume= float(kline[5])
-                
-            ))
-        if klines_to_insert:  # 🔥 Vérifier qu'on n'insère pas une liste vide
-            Kline.objects.bulk_create(klines_to_insert, ignore_conflicts=True)
-            print(f"✅ {interval} chargé pour {symbol} (total: {len(klines_to_insert)} Klines)")
+        if not data:
+            break  # Plus de données disponibles
 
+        all_klines.extend(data)
+        last_timestamp = data[0][0]  # Mettre à jour `endTime` pour la prochaine requête
 
-        # ✅ Activer le témoin APRÈS le dernier intervalle
-        with loaded_symbols_lock:
-            loaded_symbols[symbol] = True
-        #print(f"loaded symbol aprés activation d'une monnaie{loaded_symbols}")
-        print(f"🚀 {symbol} est maintenant actif !")
+    print(f"✅ Total {len(all_klines)} Klines récupérées pour {symbol}")
 
-    else:
-        print(f"❌ Erreur API Binance ({interval}) : {response.status_code} - {response.text}")        
+    # Enregistrer toutes les Klines en base
+    klines_to_insert = [
+        Kline(
+            symbole=symbol,
+            intervalle=interval,
+            timestamp=k[0],
+            open_price=float(k[1]),
+            high_price=float(k[2]),
+            low_price=float(k[3]),
+            close_price=float(k[4]),
+            volume=float(k[5])
+        ) for k in all_klines
+    ]
+
+    Kline.objects.bulk_create(klines_to_insert, ignore_conflicts=True)
+    loaded_symbols[symbol] = True
     
 def aggregate_higher_timeframe_klines(symbole):
     print(f"🔄 [DEBUG] Agrégation des Klines supérieures pour {symbole}...")
@@ -268,3 +286,160 @@ def calculate_bollinger_bands(symbol, interval, window=20):
     df["Lower_Band"] = df["SMA"] - (df["STD"] * 2)
 
     return df.iloc[-1]["Upper_Band"], df.iloc[-1]["Lower_Band"]
+
+def parse_condition(condition):
+    """
+    Transforme une condition sous forme de string ("<5") en une fonction et une valeur.
+    """
+    for op in OPERATORS:
+        if condition.startswith(op):
+            value = float(condition[len(op):])
+            return OPERATORS[op], value
+    return None, None
+
+def check_strategy_conditions(symbole, interval, conditions):
+    """
+    Vérifie si une liste de conditions est remplie pour une monnaie donnée, 
+    même si elles concernent plusieurs intervalles.
+    """
+    # Récupération initiale des indicateurs pour l'intervalle en cours
+    latest_indicator = Indicator.objects.filter(symbole=symbole, intervalle=interval).order_by("-timestamp").first()
+    
+    if not latest_indicator:
+        return False  # Pas assez de données pour l'intervalle actuel
+
+    for indicator_key, condition in conditions.items():
+        # Extraire l'indicateur et l'intervalle depuis la clé (ex: "stoch_rsi_3m")
+        parts = indicator_key.split("_")
+        if len(parts) < 2:
+            continue  # Format incorrect
+
+        indicator_name = "_".join(parts[:-1])  # ex: "stoch_rsi"
+        interval_check = parts[-1]  # ex: "3m"
+
+        # ✅ Si l'intervalle demandé n'est pas celui en cours, charger l'indicateur correct
+        if interval_check != interval:
+            latest_indicator = Indicator.objects.filter(symbole=symbole, intervalle=interval_check).order_by("-timestamp").first()
+
+            if not latest_indicator:
+                print(f"❌ Impossible de récupérer l'indicateur '{indicator_name}' sur {interval_check} pour {symbole}.")
+                return False  # On arrête si on ne trouve pas les données sur l'autre intervalle
+
+        # Récupérer la valeur de l'indicateur
+        indicator_value = getattr(latest_indicator, indicator_name, None)
+
+        if indicator_value is None:
+            print(f"❌ L'indicateur '{indicator_name}' n'est pas encore calculé sur {interval_check} pour {symbole}.")
+            return False  # L'indicateur n'existe pas encore
+
+        # Vérifier la condition
+        op_func, threshold = parse_condition(condition)
+        if not op_func or not op_func(indicator_value, threshold):
+            print(f"❌ Condition échouée pour {indicator_name} sur {interval_check} ({indicator_value} {condition}) pour {symbole}.")
+            return False  # Une condition n'est pas remplie
+
+    return True  # ✅ Toutes les conditions sont remplies
+
+def execute_strategies(symbole):
+    """
+    Vérifie toutes les stratégies actives et exécute les achats ou ventes si les conditions sont remplies.
+    """
+    try:
+        symbol_strategy = SymbolStrategy.objects.get(symbole=symbole, active=True)
+    except SymbolStrategy.DoesNotExist:
+        return  # Aucune stratégie active pour cette monnaie
+    
+    strategy = symbol_strategy.strategy
+    last_price = symbol_strategy.close_price
+
+    if last_price is None:
+        print(f"❌ Aucun prix connu pour {symbole}, achat/vente impossible.")
+        return
+
+    # ✅ Vérifier les conditions d'achat
+    if not symbol_strategy.entry_price:
+        if check_strategy_conditions(symbole, "1m", strategy.buy_conditions):
+            entry_price = last_price
+            investment_amount = symbol_strategy.investment_amount
+            quantity = investment_amount / entry_price  # Quantité achetée
+
+            # ✅ Enregistrer l'achat
+            symbol_strategy.entry_price = entry_price
+            symbol_strategy.max_price = entry_price
+            symbol_strategy.save()
+
+            # ✅ Ajouter l'achat dans le journal des trades
+            TradeLog.objects.create(
+                symbole=symbole,
+                strategy=strategy,
+                entry_price=entry_price,
+                investment_amount=investment_amount,
+                quantity=quantity
+            )
+
+            print(f"✅ Achat simulé de {quantity:.4f} {symbole} à {entry_price} USDT (Investissement: {investment_amount} USDT)")
+            return  # On ne vérifie pas la vente immédiatement après un achat
+
+    # ✅ Vérifier les conditions de vente
+    max_price = max(symbol_strategy.max_price, last_price)
+    symbol_strategy.max_price = max_price
+    symbol_strategy.save()
+
+    sell_conditions = {
+        "sell_1": last_price <= symbol_strategy.entry_price * 0.999,
+        "sell_2": last_price >= symbol_strategy.entry_price * 1.01 and (max_price / symbol_strategy.entry_price) * 0.9 >= last_price / symbol_strategy.entry_price
+    }
+
+    if any(sell_conditions.values()):
+        print(f"🚀 Vente déclenchée pour {symbole} à {last_price}")
+
+        # ✅ Fermer le trade et enregistrer la vente
+        trade = TradeLog.objects.filter(symbole=symbole, status="open").first()
+        if trade:
+            trade.close_trade(last_price)
+
+        symbol_strategy.active = False  # Désactiver la stratégie après la vente
+        symbol_strategy.save()
+
+def get_trade_statistics():
+    """
+    Renvoie les statistiques globales des trades et par monnaie.
+    """
+    stats = {}
+
+    # 🔹 Global
+    stats["total_trades"] = TradeLog.objects.count()
+    stats["open_trades"] = TradeLog.objects.filter(status="open").count()
+    stats["closed_trades"] = TradeLog.objects.filter(status="closed").count()
+
+    # 🔹 Statistiques des gains/pertes
+    closed_trades = TradeLog.objects.filter(status="closed")
+    stats["win_trades"] = closed_trades.filter(trade_result__gt=0).count()
+    stats["lose_trades"] = closed_trades.filter(trade_result__lt=0).count()
+    stats["min_gain"] = closed_trades.aggregate(Min("trade_result"))["trade_result__min"]
+    stats["max_gain"] = closed_trades.aggregate(Max("trade_result"))["trade_result__max"]
+    stats["avg_gain"] = closed_trades.aggregate(Avg("trade_result"))["trade_result__avg"]
+    stats["cumulative_gain"] = closed_trades.aggregate(Sum("trade_result"))["trade_result__sum"]
+
+    # 🔹 Durée des trades
+    stats["min_duration"] = closed_trades.aggregate(Min("duration"))["duration__min"]
+    stats["max_duration"] = closed_trades.aggregate(Max("duration"))["duration__max"]
+    stats["avg_duration"] = closed_trades.aggregate(Avg("duration"))["duration__avg"]
+
+    # 🔹 Statistiques par monnaie
+    symbols = TradeLog.objects.values_list("symbole", flat=True).distinct()
+    stats["per_symbol"] = {}
+
+    for symbol in symbols:
+        trades = TradeLog.objects.filter(symbole=symbol, status="closed")
+        stats["per_symbol"][symbol] = {
+            "total": trades.count(),
+            "win": trades.filter(trade_result__gt=0).count(),
+            "lose": trades.filter(trade_result__lt=0).count(),
+            "avg_gain": trades.aggregate(Avg("trade_result"))["trade_result__avg"],
+            "max_gain": trades.aggregate(Max("trade_result"))["trade_result__max"],
+            "min_gain": trades.aggregate(Min("trade_result"))["trade_result__min"],
+            "cumulative_gain": trades.aggregate(Sum("trade_result"))["trade_result__sum"],
+        }
+
+    return stats

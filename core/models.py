@@ -1,4 +1,5 @@
 from django.db import models
+from django.utils.timezone import now
 
 
 class Monnaie(models.Model):
@@ -62,7 +63,41 @@ class SymbolStrategy(models.Model):
     strategy = models.ForeignKey(Strategy, on_delete=models.CASCADE)
     entry_price = models.FloatField(null=True, blank=True)  # Prix d'achat
     max_price = models.FloatField(default=0.0)  # Prix max après achat
+    investment_amount = models.FloatField(default=100.0)  # Montant investi par trade
+    close_price = models.FloatField(null=True, blank=True)
     active = models.BooleanField(default=True)  # Si la stratégie est en cours
 
     def __str__(self):
         return f"{self.symbole} - {self.strategy.name}"
+    
+class TradeLog(models.Model):
+    """
+    Journalisation des trades (achats et ventes).
+    """
+    symbole = models.CharField(max_length=20)
+    strategy = models.ForeignKey("Strategy", on_delete=models.SET_NULL, null=True)
+    entry_price = models.FloatField()
+    exit_price = models.FloatField(null=True, blank=True)
+    trade_result = models.FloatField(null=True, blank=True)  # Gain/perte en %
+    entry_time = models.DateTimeField(default=now)
+    exit_time = models.DateTimeField(null=True, blank=True)
+    duration = models.FloatField(null=True, blank=True)  # Durée du trade en minutes
+    status = models.CharField(
+        max_length=10,
+        choices=[("open", "En cours"), ("closed", "Fermé")],
+        default="open"
+    )
+
+    def close_trade(self, exit_price):
+        """
+        Ferme le trade et enregistre le gain/perte.
+        """
+        self.exit_price = exit_price
+        self.exit_time = now()
+        self.duration = (self.exit_time - self.entry_time).total_seconds() / 60  # Convertir en minutes
+        self.trade_result = ((exit_price - self.entry_price) / self.entry_price) * 100  # % de gain/perte
+        self.status = "closed"
+        self.save()
+
+    def __str__(self):
+        return f"{self.symbole} | {self.strategy.name} | {self.trade_result:.2f}% ({self.status})"    
