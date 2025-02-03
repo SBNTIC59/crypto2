@@ -7,6 +7,9 @@ import pandas as pd
 import threading
 import numpy as np
 import operator
+import decimal
+from django.utils.timezone import now
+
 
 OPERATORS = {
     "<": operator.lt,
@@ -15,6 +18,7 @@ OPERATORS = {
     ">=": operator.ge,
     "==": operator.eq
 }
+INVESTMENT_AMOUNT = decimal.Decimal("100")
 
 loaded_symbols = {}
 print(f"✅ [DEBUG] loaded_symbols défini dans utils : {loaded_symbols}")
@@ -289,117 +293,148 @@ def calculate_bollinger_bands(symbol, interval, window=20):
 
 def parse_condition(condition):
     """
-    Transforme une condition sous forme de string ("<5") en une fonction et une valeur.
+    Analyse une condition sous forme de chaîne et retourne l'opérateur et la valeur.
     """
-    for op in OPERATORS:
+    print(f"🔎 Analyse de la condition : {condition}")  # Debugging
+
+    for op in OPERATORS.keys():
         if condition.startswith(op):
-            value = float(condition[len(op):])
-            return OPERATORS[op], value
+            try:
+                valeur_numerique = float(condition[len(op):])  # Convertir en float après l'opérateur
+                print(f"✅ Opérateur détecté : {op}, Valeur : {valeur_numerique}")  # Debugging
+                return OPERATORS[op], valeur_numerique
+            except ValueError:
+                print(f"⚠️ Erreur de conversion dans parse_condition() : {condition}")
+                return None, None
+
+    print(f"❌ Aucune correspondance trouvée pour : {condition}")
     return None, None
 
 def check_strategy_conditions(symbole, interval, conditions):
     """
-    Vérifie si une liste de conditions est remplie pour une monnaie donnée, 
-    même si elles concernent plusieurs intervalles.
+    Vérifie si une liste de conditions est remplie pour une monnaie donnée.
     """
-    # Récupération initiale des indicateurs pour l'intervalle en cours
+    from core.models import Indicator  
+
     latest_indicator = Indicator.objects.filter(symbole=symbole, intervalle=interval).order_by("-timestamp").first()
-    
+
     if not latest_indicator:
-        return False  # Pas assez de données pour l'intervalle actuel
+        print(f"⚠️ Aucune donnée d'indicateur pour {symbole} {interval}, impossible de tester la stratégie.")
+        return False
 
-    for indicator_key, condition in conditions.items():
-        # Extraire l'indicateur et l'intervalle depuis la clé (ex: "stoch_rsi_3m")
-        parts = indicator_key.split("_")
-        if len(parts) < 2:
-            continue  # Format incorrect
+    print(f"🔍 Test de la stratégie pour {symbole} sur {interval}...")
 
-        indicator_name = "_".join(parts[:-1])  # ex: "stoch_rsi"
-        interval_check = parts[-1]  # ex: "3m"
+    # Vérifier si `conditions` est un bloc `AND` ou `OR`
+    if isinstance(conditions, dict) and "type" in conditions and "rules" in conditions:
+        condition_type = conditions["type"]
+        rules = conditions["rules"]
 
-        # ✅ Si l'intervalle demandé n'est pas celui en cours, charger l'indicateur correct
+        if not isinstance(rules, list):
+            print(f"⚠️ Erreur : `rules` doit être une liste mais a reçu {type(rules)} -> {rules}")
+            return False  
+
+        print(f"🔗 Bloc {condition_type} détecté...")
+
+        if condition_type == "AND":
+            if not all(check_strategy_conditions(symbole, interval, rule) for rule in rules):
+                print(f"❌ Échec d'un test AND, stratégie non validée.")
+                return False
+
+        elif condition_type == "OR":
+            if any(check_strategy_conditions(symbole, interval, rule) for rule in rules):
+                print(f"✅ Succès d'un test OR, stratégie validée.")
+                return True
+
+        return False  # Si aucune condition valide n'est trouvée
+
+    # Vérifier si `conditions` est une liste de conditions individuelles
+    if isinstance(conditions, dict) and "conditions" in conditions:
+        conditions = conditions["conditions"]
+
+    if not isinstance(conditions, list):
+        print(f"⚠️ `conditions` doit être une liste, reçu : {conditions}")
+        return False  
+
+    # 🔥 Correction : Vérifier que nous traitons bien des conditions individuelles
+    for condition in conditions:
+        if not isinstance(condition, dict):
+            print(f"⚠️ Condition ignorée (pas un dictionnaire) : {condition}")
+            continue  
+
+        # **🔥 Vérification supplémentaire : éviter de traiter des blocs `AND` et `OR` comme des conditions**
+        if "type" in condition and "rules" in condition:
+            print(f"⚠️ Ignoré : bloc {condition['type']} trouvé dans une boucle de conditions simples")
+            continue  
+
+        required_keys = ["metric", "operator", "value"]
+        missing_keys = [key for key in required_keys if key not in condition]
+
+        if missing_keys:
+            print(f"⚠️ Condition incomplète, clés manquantes : {missing_keys} dans {condition}")
+            continue  
+
+        metric = condition["metric"]
+        interval_check = condition.get("interval", interval)  
+        operator_str = condition["operator"]
+        value = condition["value"]
+
         if interval_check != interval:
-            latest_indicator = Indicator.objects.filter(symbole=symbole, intervalle=interval_check).order_by("-timestamp").first()
-
-            if not latest_indicator:
-                print(f"❌ Impossible de récupérer l'indicateur '{indicator_name}' sur {interval_check} pour {symbole}.")
-                return False  # On arrête si on ne trouve pas les données sur l'autre intervalle
+            print(f"❌ Condition ignorée ({metric} {interval_check}), attendu {interval}")
+            continue
 
         # Récupérer la valeur de l'indicateur
-        indicator_value = getattr(latest_indicator, indicator_name, None)
+        indicator_value = getattr(latest_indicator, metric, None)
 
         if indicator_value is None:
-            print(f"❌ L'indicateur '{indicator_name}' n'est pas encore calculé sur {interval_check} pour {symbole}.")
-            return False  # L'indicateur n'existe pas encore
+            print(f"⚠️ L'indicateur {metric} n'existe pas encore pour {symbole}")
+            return False
 
         # Vérifier la condition
-        op_func, threshold = parse_condition(condition)
-        if not op_func or not op_func(indicator_value, threshold):
-            print(f"❌ Condition échouée pour {indicator_name} sur {interval_check} ({indicator_value} {condition}) pour {symbole}.")
-            return False  # Une condition n'est pas remplie
+        op_func, threshold = parse_condition(f"{operator_str}{value}")
 
-    return True  # ✅ Toutes les conditions sont remplies
+        if not op_func:
+            print(f"⚠️ Condition mal formée lors de l'analyse de l'opérateur : {condition}")
+            return False
+
+        print(f"🔹 Test {metric} = {indicator_value} {operator_str} {value} ?")
+        if not op_func(indicator_value, threshold):
+            print(f"❌ Condition non remplie : {metric} = {indicator_value}, attendu {operator_str} {value}")
+            return False  
+
+    print(f"✅ Toutes les conditions sont remplies pour {symbole} sur {interval} !")
+    return True  
+
 
 def execute_strategies(symbole):
     """
-    Vérifie toutes les stratégies actives et exécute les achats ou ventes si les conditions sont remplies.
+    Vérifie les stratégies d'achat pour un symbole donné.
     """
-    try:
-        symbol_strategy = SymbolStrategy.objects.get(symbole=symbole, active=True)
-    except SymbolStrategy.DoesNotExist:
-        return  # Aucune stratégie active pour cette monnaie
-    
-    strategy = symbol_strategy.strategy
-    last_price = symbol_strategy.close_price
+    from core.models import SymbolStrategy
 
-    if last_price is None:
-        print(f"❌ Aucun prix connu pour {symbole}, achat/vente impossible.")
+    strategy_obj = SymbolStrategy.objects.filter(symbole=symbole).first()
+
+    if not strategy_obj:
+        print(f"⚠️ Aucune stratégie trouvée pour {symbole}")
         return
 
-    # ✅ Vérifier les conditions d'achat
-    if not symbol_strategy.entry_price:
-        if check_strategy_conditions(symbole, "1m", strategy.buy_conditions):
-            entry_price = last_price
-            investment_amount = symbol_strategy.investment_amount
-            quantity = investment_amount / entry_price  # Quantité achetée
+    strategy = strategy_obj.strategy
+    if not strategy:
+        print(f"⚠️ Pas de stratégie définie pour {symbole}")
+        return
+    
+    conditions_achat = strategy.buy_conditions  
 
-            # ✅ Enregistrer l'achat
-            symbol_strategy.entry_price = entry_price
-            symbol_strategy.max_price = entry_price
-            symbol_strategy.save()
+    if not conditions_achat:
+        print(f"⚠️ Aucune condition d'achat définie pour {symbole}")
+        return
 
-            # ✅ Ajouter l'achat dans le journal des trades
-            TradeLog.objects.create(
-                symbole=symbole,
-                strategy=strategy,
-                entry_price=entry_price,
-                investment_amount=investment_amount,
-                quantity=quantity
-            )
+    print(f"🔎 Test d'achat pour {symbole}")
 
-            print(f"✅ Achat simulé de {quantity:.4f} {symbole} à {entry_price} USDT (Investissement: {investment_amount} USDT)")
-            return  # On ne vérifie pas la vente immédiatement après un achat
-
-    # ✅ Vérifier les conditions de vente
-    max_price = max(symbol_strategy.max_price, last_price)
-    symbol_strategy.max_price = max_price
-    symbol_strategy.save()
-
-    sell_conditions = {
-        "sell_1": last_price <= symbol_strategy.entry_price * 0.999,
-        "sell_2": last_price >= symbol_strategy.entry_price * 1.01 and (max_price / symbol_strategy.entry_price) * 0.9 >= last_price / symbol_strategy.entry_price
-    }
-
-    if any(sell_conditions.values()):
-        print(f"🚀 Vente déclenchée pour {symbole} à {last_price}")
-
-        # ✅ Fermer le trade et enregistrer la vente
-        trade = TradeLog.objects.filter(symbole=symbole, status="open").first()
-        if trade:
-            trade.close_trade(last_price)
-
-        symbol_strategy.active = False  # Désactiver la stratégie après la vente
-        symbol_strategy.save()
+    if check_strategy_conditions(symbole, "1m", conditions_achat):
+        print(f"✅ Achat validé pour {symbole} !")
+        acheter(symbole)  
+    else:
+        print(f"❌ Achat non validé pour {symbole}.")
 
 def get_trade_statistics():
     """
@@ -443,3 +478,155 @@ def get_trade_statistics():
         }
 
     return stats
+
+def acheter(symbole):
+    """
+    Simule l'achat d'une monnaie en enregistrant un trade dans la base de données.
+    """
+    # 🔍 Récupérer le dernier prix connu de la monnaie
+    prix_achat = get_latest_price(symbole)
+    
+    if prix_achat is None:
+        print(f"❌ Impossible d'acheter {symbole} : prix non disponible !")
+        return
+    
+    # 🏦 Calculer la quantité achetée
+    quantite = INVESTMENT_AMOUNT / prix_achat
+
+    # 📌 Enregistrer le trade dans la base
+    trade = TradeLog.objects.create(
+        symbole=symbole,
+        prix_achat=prix_achat,
+        prix_max=prix_achat,  # Initialisation du prix max
+        status="open",
+        entry_time=now(),  # Date d'achat
+        investment_amount=INVESTMENT_AMOUNT,
+        quantity=quantite,
+        strategy_json={"buy_conditions": "Exemple"}  # Tu peux mettre ici la vraie stratégie
+    )
+
+    print(f"🚀 Achat exécuté : {trade.symbole} | Prix: {trade.prix_achat} USDT | Quantité: {trade.quantity} | ID: {trade.id}")
+
+def get_latest_price(symbole):
+    """
+    Récupère le dernier prix connu de la monnaie à partir des Klines en base.
+    """
+    from core.models import Kline
+
+    dernier_kline = Kline.objects.filter(symbole=symbole, intervalle="1m").order_by("-timestamp").first()
+    
+    if dernier_kline:
+        return decimal.Decimal(dernier_kline.close_price)
+    
+    return None  # Aucun prix trouvé
+
+def evaluate_expression(value, trade):
+    """
+    Évalue une expression en remplaçant les variables par les valeurs du trade.
+    Ex: "prix_achat * 0.999" devient "100 * 0.999"
+    """
+    variables = {
+        "prix_achat": trade.prix_achat,
+        "prix_actuel": trade.prix_actuel or trade.prix_achat,  # Valeur actuelle ou prix d'achat
+        "prix_max": trade.prix_max or trade.prix_achat  # Valeur max atteinte
+    }
+    
+    try:
+        return eval(value, {}, variables)  # Sécurité : on n'expose que les variables permises
+    except Exception as e:
+        print(f"⚠️ Erreur lors de l'évaluation de l'expression {value}: {e}")
+        return None
+
+def check_sell_conditions(trade, conditions):
+    """
+    Vérifie si les conditions de vente sont remplies en gérant les `ET` et `OU`.
+    """
+    if not conditions:
+        return False  # Pas de condition définie
+    
+    for condition in conditions.get("conditions", []):
+        if "type" in condition and "rules" in condition:
+            if condition["type"] == "AND":
+                if not all(check_sell_conditions(trade, {"conditions": [rule]}) for rule in condition["rules"]):
+                    return False  # Un seul `False` invalide tout le bloc AND
+            elif condition["type"] == "OR":
+                if any(check_sell_conditions(trade, {"conditions": [rule]}) for rule in condition["rules"]):
+                    return True  # Un seul `True` suffit à valider un bloc OR
+            continue  # Passer aux autres conditions
+
+        metric = condition["metric"]
+        operator_str = condition["operator"]
+        value_expr = condition["value"]
+
+        if metric not in ["prix_actuel", "prix_achat", "prix_max"]:
+            print(f"⚠️ Métier inconnu : {metric}")
+            continue
+
+        # Récupérer les valeurs réelles
+        metric_value = evaluate_expression(metric, trade)
+        condition_value = evaluate_expression(value_expr, trade)
+
+        if metric_value is None or condition_value is None:
+            continue  # Impossible de comparer
+
+        op_func = OPERATORS.get(operator_str)
+        if not op_func:
+            print(f"⚠️ Opérateur inconnu : {operator_str}")
+            continue
+        
+        # Vérification de la condition
+        if op_func(metric_value, condition_value):
+            return True
+    
+    return False
+
+def execute_sell_strategy():
+    """
+    Vérifie les stratégies de vente et clôture les trades si nécessaire.
+    """
+    from core.models import TradeLog
+    from core.utils import update_trade_prices, check_strategy_conditions
+
+    # 🔄 Mise à jour des prix avant de vendre
+    update_trade_prices()
+
+    open_trades = TradeLog.objects.filter(status="open")
+
+    for trade in open_trades:
+        strategy = trade.strategy_json  # Récupère la stratégie du trade
+
+        if not strategy or "sell_conditions" not in strategy:
+            print(f"⚠️ Aucune condition de vente définie pour {trade.symbole}")
+            continue
+
+        conditions_vente = strategy["sell_conditions"]
+
+        print(f"🔎 Test de vente pour {trade.symbole} | Prix actuel: {trade.prix_actuel} | Prix achat: {trade.prix_achat} | Prix max: {trade.prix_max}")
+        print(f"🧐 Conditions de vente trouvées : {conditions_vente}")
+
+        if check_strategy_conditions(trade.symbole, "1m", conditions_vente):
+            print(f"✅ Vente validée pour {trade.symbole} | Prix actuel: {trade.prix_actuel}")
+            trade.close_trade(trade.prix_actuel)  # Ferme le trade immédiatement
+            trade.status = "closed"  # 🔥 Empêche la revente du même trade
+            trade.save()
+        else:
+            print(f"❌ Vente non validée pour {trade.symbole} | Prix actuel: {trade.prix_actuel}")
+
+
+def update_trade_prices():
+    """
+    Met à jour les prix actuels des trades ouverts en utilisant les Klines les plus récentes.
+    """
+    open_trades = TradeLog.objects.filter(status="open")
+
+    for trade in open_trades:
+        latest_kline = Kline.objects.filter(symbole=trade.symbole, intervalle="1m").order_by("-timestamp").first()
+
+        if latest_kline:
+            trade.prix_actuel = latest_kline.close_price
+            if trade.prix_max is None or trade.prix_actuel > trade.prix_max:
+                trade.prix_max = trade.prix_actuel  # Mise à jour du prix max atteint
+            trade.save()
+            print(f"🔄 Prix mis à jour : {trade.symbole} | Prix actuel: {trade.prix_actuel} | Prix max: {trade.prix_max}")
+        else:
+            print(f"⚠️ Aucune Kline récente trouvée pour {trade.symbole}, prix non mis à jour.")

@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Monnaie, Strategy, SymbolStrategy
+from .models import Monnaie, Strategy, SymbolStrategy, TradeLog
 
 @admin.register(Monnaie)
 class MonnaieAdmin(admin.ModelAdmin):
@@ -17,3 +17,9 @@ class SymbolStrategyAdmin(admin.ModelAdmin):
     list_display = ("symbole", "strategy", "entry_price", "active")
     search_fields = ("symbole",)
     list_filter = ("strategy", "active")
+
+@admin.register(TradeLog)
+class TradeAdmin(admin.ModelAdmin):
+    list_display = ("symbole", "prix_achat", "prix_actuel", "status", "strategy_json")
+    list_filter = ("status", "symbole")
+    search_fields = ("symbole",)

@@ -71,33 +71,33 @@ class SymbolStrategy(models.Model):
         return f"{self.symbole} - {self.strategy.name}"
     
 class TradeLog(models.Model):
-    """
-    Journalisation des trades (achats et ventes).
-    """
     symbole = models.CharField(max_length=20)
-    strategy = models.ForeignKey("Strategy", on_delete=models.SET_NULL, null=True)
-    entry_price = models.FloatField()
-    exit_price = models.FloatField(null=True, blank=True)
-    trade_result = models.FloatField(null=True, blank=True)  # Gain/perte en %
-    entry_time = models.DateTimeField(default=now)
-    exit_time = models.DateTimeField(null=True, blank=True)
-    duration = models.FloatField(null=True, blank=True)  # Durée du trade en minutes
-    status = models.CharField(
-        max_length=10,
-        choices=[("open", "En cours"), ("closed", "Fermé")],
-        default="open"
-    )
+    prix_achat = models.DecimalField(max_digits=10, decimal_places=2, default=0.00) 
+    prix_actuel = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    prix_max = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
 
-    def close_trade(self, exit_price):
+    entry_time = models.DateTimeField(auto_now_add=True)  # Date d'entrée
+    exit_time = models.DateTimeField(null=True, blank=True)  # Date de sortie (fermeture du trade)
+    duration = models.FloatField(null=True, blank=True)  # Durée du trade en minutes
+    trade_result = models.FloatField(null=True, blank=True)  # % de gain/perte
+
+    investment_amount = models.DecimalField(max_digits=15, decimal_places=2, default=0)  # Montant investi
+    quantity = models.DecimalField(max_digits=20, decimal_places=8, default=0)  # Quantité achetée
+
+    status = models.CharField(max_length=10, choices=[("open", "Open"), ("closed", "Closed")], default="open")
+    strategy_json = models.JSONField(default=dict)  # Stocke la stratégie utilisée
+
+    def close_trade(self, prix_actuel):
         """
         Ferme le trade et enregistre le gain/perte.
         """
-        self.exit_price = exit_price
+        self.prix_actuel = prix_actuel
         self.exit_time = now()
         self.duration = (self.exit_time - self.entry_time).total_seconds() / 60  # Convertir en minutes
-        self.trade_result = ((exit_price - self.entry_price) / self.entry_price) * 100  # % de gain/perte
+        self.trade_result = ((prix_actuel - self.prix_achat) / self.prix_achat) * 100  # % de gain/perte
         self.status = "closed"
         self.save()
 
     def __str__(self):
-        return f"{self.symbole} | {self.strategy.name} | {self.trade_result:.2f}% ({self.status})"    
+        trade_result_str = f"{self.trade_result:.2f}%" if self.trade_result is not None else "N/A"
+        return f"{self.symbole} | {trade_result_str} ({self.status})"
