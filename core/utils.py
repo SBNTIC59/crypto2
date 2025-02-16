@@ -1,6 +1,6 @@
 import requests
 import time
-from core.models import Kline, Indicator, Indicator, SymbolStrategy, TradeLog
+from core.models import Kline, Indicator, Indicator, TradeLog, APIKey, Strategy, Monnaie
 from django.db.models import Min, Max, Sum, Avg, Count
 from datetime import datetime, timezone
 import pandas as pd
@@ -9,8 +9,11 @@ import numpy as np
 import operator
 import decimal
 from django.utils.timezone import now
+from django.db import transaction
+import talib
 
 
+sell_conditions_lock = threading.Lock()
 OPERATORS = {
     "<": operator.lt,
     "<=": operator.le,
@@ -24,7 +27,10 @@ loaded_symbols = {}
 print(f"✅ [DEBUG] loaded_symbols défini dans utils : {loaded_symbols}")
 loaded_symbols_lock = threading.Lock()#
 
+
 BINANCE_BASE_URL = "https://api.binance.com/api/v3"
+BINANCE_KLINES_URL = BINANCE_BASE_URL + "/klines"
+
 BINANCE_BASE_URL_klines = BINANCE_BASE_URL + "/klines"
 BINANCE_BASE_URL_liste  =  BINANCE_BASE_URL +"/exchangeInfo"
 
@@ -55,47 +61,67 @@ def get_all_usdt_pairs():
         print(f"❌ Erreur lors de la récupération des paires Binance: {response.status_code}")
         return []
 
+#def load_historical_klines():
+#    """
+#    Charge l'historique des Klines pour toutes les paires USDT.
+#    """
+#    from core.utils import get_historical_klines
+#
+#    symbols = get_all_usdt_pairs()
+#    for symbol in symbols:
+#        print(f"🔄 Chargement des Klines pour {symbol}...")
+#        get_historical_klines(symbol, "1m")
+#
+def get_historical_klines(symbol, interval, limit=1000):
+    """
+    Récupère l'historique des Klines depuis Binance avec gestion des erreurs.
+    """
+    api_key, secret_key = get_binance_credentials()
+    if not api_key or not secret_key:
+        print("❌ Impossible de récupérer les Klines : Clés API manquantes.")
+        return []
+
+    headers = {"X-MBX-APIKEY": api_key}
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    
+    for _ in range(3):  # 🔄 Retry 3 fois en cas d'erreur
+        try:
+            response = requests.get(BINANCE_KLINES_URL, headers=headers, params=params, timeout=10)
+            response.raise_for_status()  # Lève une erreur si le code HTTP est != 200
+            return response.json()
+        except requests.exceptions.Timeout:
+            print(f"⚠️ Timeout Binance pour {symbol} {interval}, tentative de reconnexion...")
+            time.sleep(5)
+        except requests.exceptions.HTTPError as e:
+            print(f"❌ Erreur API Binance ({symbol}, {interval}) : {e}")
+            return []
+        except Exception as e:
+            print(f"⚠️ Erreur inattendue : {e}")
+            return []
+
+    print(f"❌ Impossible de récupérer les Klines après 3 tentatives ({symbol}, {interval}).")
+    return []
+
 def load_historical_klines():
     """
-    Charge l'historique des Klines pour toutes les paires USDT.
+    Charge l'historique des Klines pour toutes les paires USDT et tous les intervalles nécessaires.
     """
-    from core.utils import get_historical_klines
-
     symbols = get_all_usdt_pairs()
+    intervals = ["1m", "3m", "5m", "15m", "1h", "4h", "1d"]
+
     for symbol in symbols:
-        print(f"🔄 Chargement des Klines pour {symbol}...")
-        get_historical_klines(symbol, "1m")
+        #print(f"🔄 Chargement des Klines pour {symbol}...")
+        for interval in intervals:
+            klines = get_historical_klines(symbol, interval)
+            if klines:
+                save_klines_to_db(symbol, interval, klines)
+                calculate_indicators(symbol)
+                Monnaie.objects.filter(symbole=symbol).update(init=True)
 
-def get_historical_klines(symbol, interval, limit=5000):
-    global loaded_symbols
-
-    print(f"🔄 Chargement de l'historique ({limit} Klines) pour {symbol}...")
-
-    all_klines = []
-    last_timestamp = None
-
-    while len(all_klines) < limit:
-        request_limit = min(1000, limit - len(all_klines))  # Ne pas dépasser `limit`
-        url = f"{BINANCE_BASE_URL}?symbol={symbol}&interval={interval}&limit={request_limit}"
-        
-        if last_timestamp:
-            url += f"&endTime={last_timestamp}"  # Charger des Klines plus anciennes
-
-        response = requests.get(url)
-        if response.status_code != 200:
-            print(f"❌ Erreur API Binance : {response.status_code} - {response.text}")
-            break
-
-        data = response.json()
-        if not data:
-            break  # Plus de données disponibles
-
-        all_klines.extend(data)
-        last_timestamp = data[0][0]  # Mettre à jour `endTime` pour la prochaine requête
-
-    print(f"✅ Total {len(all_klines)} Klines récupérées pour {symbol}")
-
-    # Enregistrer toutes les Klines en base
+def save_klines_to_db(symbol, interval, klines):
+    """
+    Enregistre les Klines récupérées en base de données.
+    """
     klines_to_insert = [
         Kline(
             symbole=symbol,
@@ -106,134 +132,137 @@ def get_historical_klines(symbol, interval, limit=5000):
             low_price=float(k[3]),
             close_price=float(k[4]),
             volume=float(k[5])
-        ) for k in all_klines
+        ) for k in klines
     ]
 
     Kline.objects.bulk_create(klines_to_insert, ignore_conflicts=True)
-    loaded_symbols[symbol] = True
-    
-def aggregate_higher_timeframe_klines(symbole):
-    print(f"🔄 [DEBUG] Agrégation des Klines supérieures pour {symbole}...")
+    #print(f"✅ {len(klines_to_insert)} Klines enregistrées pour {symbol} ({interval})")
 
-    intervals = {"3m": 3, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+def aggregate_higher_timeframe_klines(symbole, kline_1m):
+    """
+    Met à jour les Klines des intervalles supérieurs (3m, 5m...) à partir de la dernière Kline 1m reçue.
+    """
+    intervals = {
+        "3m": 3,
+        "5m": 5,
+        "15m": 15,
+        "1h": 60,
+        "4h": 240,
+        "1d": 1440,
+    }
 
-    for interval, factor in intervals.items():
-        print(f"  ➡️ Agrégation pour {interval} (nécessite {factor} bougies 1m)")
+    timestamp_1m = kline_1m.timestamp
+    open_price_1m = kline_1m.open_price
+    high_price_1m = kline_1m.high_price
+    low_price_1m = kline_1m.low_price
+    close_price_1m = kline_1m.close_price
+    volume_1m = kline_1m.volume
 
-        # Récupérer la dernière bougie 1m en base
-        last_kline_1m = Kline.objects.filter(symbole=symbole, intervalle="1m").order_by("-timestamp").first()
-        if not last_kline_1m:
-            print(f"⚠️ Aucune bougie 1m disponible pour {symbole}, impossible d'agréger {interval}")
-            continue
+    for interval, duration in intervals.items():
+        # Timestamp group correspondant à cette Kline 1m pour l'intervalle
+        timestamp_group = timestamp_1m - (timestamp_1m % (duration * 60 * 1000))
 
-        last_timestamp = last_kline_1m.timestamp
-
-        # Trouver le timestamp de début du nouvel intervalle
-        aligned_timestamp = last_timestamp - (last_timestamp % (factor * 60 * 1000))
-
-        # Récupérer toutes les bougies 1m qui appartiennent à cet intervalle
-        klines_1m = list(Kline.objects.filter(
-            symbole=symbole,
-            intervalle="1m",
-            timestamp__gte=aligned_timestamp
-        ).order_by("timestamp"))
-
-        print(f"  🔍 {len(klines_1m)} bougies 1m trouvées pour {interval}")
-
-        if len(klines_1m) < factor:
-            print(f"⚠️ Pas assez de bougies 1m alignées pour générer {interval} ({len(klines_1m)} trouvées)")
-            continue
-
-        open_price = klines_1m[0].open_price
-        close_price = klines_1m[-1].close_price
-        high_price = max(k.high_price for k in klines_1m)
-        low_price = min(k.low_price for k in klines_1m)
-        volume = sum(k.volume for k in klines_1m)
-
-        # Insérer ou mettre à jour la Kline agrégée
-        kline, created = Kline.objects.update_or_create(
+        # Chercher la Kline actuelle sur cet intervalle
+        aggregated_kline, created = Kline.objects.get_or_create(
             symbole=symbole,
             intervalle=interval,
-            timestamp=aligned_timestamp,
+            timestamp=timestamp_group,
             defaults={
-                "open_price": open_price,
-                "high_price": high_price,
-                "low_price": low_price,
-                "close_price": close_price,
-                "volume": volume,
+                'open_price': open_price_1m,
+                'high_price': high_price_1m,
+                'low_price': low_price_1m,
+                'close_price': close_price_1m,
+                'volume': volume_1m,
             }
         )
 
-        if created:
-            print(f"✅ Nouvelle Kline {interval} créée pour {symbole} à {aligned_timestamp}")
-        else:
-            print(f"♻️ Kline {interval} mise à jour pour {symbole} à {aligned_timestamp}")
+        if not created:
+            # Mise à jour de la Kline si elle existait déjà (encore en cours)
+            aggregated_kline.high_price = max(aggregated_kline.high_price, high_price_1m)
+            aggregated_kline.low_price = min(aggregated_kline.low_price, low_price_1m)
+            aggregated_kline.close_price = close_price_1m
+            aggregated_kline.volume += volume_1m
+            aggregated_kline.save()
 
-def calculate_indicators(symbol, interval):
-    """
-    Calcule le MACD, RSI et les bandes de Bollinger pour un symbole donné et un intervalle.
-    """
-    print(f"📊 Début du calcul des indicateurs pour {symbol} ({interval})")
-    klines = list(Kline.objects.filter(symbole=symbol, intervalle=interval).order_by("timestamp").values())
+        # Détecter la fin de la période pour finaliser proprement
+        next_1m_timestamp = timestamp_1m + 60 * 1000
+        next_timestamp_group = next_1m_timestamp - (next_1m_timestamp % (duration * 60 * 1000))
 
-    if len(klines) < 50:  # Assurez-vous d'avoir assez de données
-        return None
+        if next_timestamp_group != timestamp_group:
+            # On considère que la bougie précédente est clôturée
+            calculate_indicators(symbole, interval)
 
-    df = pd.DataFrame(klines)
-    df["close_price"] = df["close_price"].astype(float)
 
-    # ✅ Calcul du MACD
-    short_ema = df["close_price"].ewm(span=12, adjust=False).mean()
-    long_ema = df["close_price"].ewm(span=26, adjust=False).mean()
-    df["macd"] = short_ema - long_ema
-    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+def calculate_indicators(symbole, interval=None):
+    intervals = [interval] if interval else ["1m", "3m", "5m", "15m", "1h", "4h", "1d"]
 
-    # ✅ Calcul du RSI
-    delta = df["close_price"].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    for interval in intervals:
+        klines = Kline.objects.filter(symbole=symbole, intervalle=interval).order_by("-timestamp")[:50]
+
+        if len(klines) < 26:
+            continue
+
+        closes = np.array([float(k.close_price) for k in reversed(klines)])
+        highs = np.array([float(k.high_price) for k in reversed(klines)])
+        lows = np.array([float(k.low_price) for k in reversed(klines)])
+
+        macd, macd_signal, _ = talib.MACD(closes, fastperiod=12, slowperiod=26, signalperiod=9)
+        rsi = talib.RSI(closes, timeperiod=14)
+        fastk, fastd = talib.STOCHRSI(closes, timeperiod=14, fastk_period=3, fastd_period=3, fastd_matype=0)
+        upper, middle, lower = talib.BBANDS(closes, timeperiod=20, nbdevup=2, nbdevdn=2, matype=0)
+
+        last_kline = klines[0]
+        Indicator.objects.update_or_create(
+            symbole=symbole,
+            intervalle=interval,
+            timestamp=last_kline.timestamp,
+            defaults={
+                'macd': macd[-1],
+                'macd_signal': macd_signal[-1],
+                'rsi': rsi[-1],
+                'stoch_rsi': fastk[-1],
+                'bollinger_upper': upper[-1],
+                'bollinger_middle': middle[-1],
+                'bollinger_lower': lower[-1],
+            }
+        )
+
+import pandas as pd
+import numpy as np
+
+def calculate_stoch_rsi(symbol, interval, rsi_length=14, stoch_length=14, smooth_k=3):
+    # Récupération des Klines (assurez-vous d'avoir les bons champs dans votre modèle)
+    klines = Kline.objects.filter(symbole=symbol, intervalle=interval).order_by("-timestamp")[:rsi_length + stoch_length + smooth_k]
+
+    if len(klines) < rsi_length + stoch_length + smooth_k:
+        return None  # Pas assez de données
+
+    df = pd.DataFrame(list(klines.values("close_price")))
+    df["delta"] = df["close_price"].diff()
+
+    # Calcul du RSI (14 périodes)
+    gain = df["delta"].where(df["delta"] > 0, 0).rolling(window=rsi_length).mean()
+    loss = -df["delta"].where(df["delta"] < 0, 0).rolling(window=rsi_length).mean()
+
     rs = gain / loss
     df["rsi"] = 100 - (100 / (1 + rs))
 
-    # ✅ Calcul du StochRSI
-    min_rsi = df["rsi"].rolling(window=14).min()
-    max_rsi = df["rsi"].rolling(window=14).max()
+    # Calcul du Stoch RSI brut (%K avant lissage)
+    min_rsi = df["rsi"].rolling(window=stoch_length).min()
+    max_rsi = df["rsi"].rolling(window=stoch_length).max()
+
     df["stoch_rsi"] = (df["rsi"] - min_rsi) / (max_rsi - min_rsi)
+    df["stoch_rsi"] = df["stoch_rsi"].fillna(0)  # Remplacer les NaN par 0 si division par zéro
 
-    # ✅ Calcul des Bollinger Bands
-    df["bollinger_middle"] = df["close_price"].rolling(window=20).mean()  # ✅ Ajout de la bande médiane
-    rolling_std = df["close_price"].rolling(window=20).std()
-    df["bollinger_upper"] = df["bollinger_middle"] + (rolling_std * 2)
-    df["bollinger_lower"] = df["bollinger_middle"] - (rolling_std * 2)    
+    # Lissage du %K (SMA sur 3 périodes)
+    df["%K"] = df["stoch_rsi"].rolling(window=smooth_k).mean() * 100  # Convertir en %
 
-    latest = df.iloc[-1]  # On prend la dernière ligne
-    print(f"📌 Derniers indicateurs pour {symbol} ({interval}):")
-    print(f"  MACD: {latest['macd']:.2f}, MACD Signal: {latest['macd_signal']:.2f}")
-    print(f"  RSI: {latest['rsi']:.2f}")
-    print(f"  Bollinger: {latest['bollinger_lower']:.2f} - {latest['bollinger_upper']:.2f}")
+    # Dernière valeur du %K
+    stoch_rsi_k = round(df["%K"].iloc[-1], 2)
 
-    # ✅ Enregistrement en base
-    Indicator.objects.update_or_create(
-        symbole=symbol,
-        intervalle=interval,
-        timestamp=int(latest["timestamp"]),
-        defaults={
-            "macd": latest["macd"],
-            "macd_signal": latest["macd_signal"],
-            "rsi": latest["rsi"],
-            "stoch_rsi": latest["stoch_rsi"],
-            "bollinger_upper": latest["bollinger_upper"],
-            "bollinger_middle": latest["bollinger_middle"],
-            "bollinger_lower": latest["bollinger_lower"],
-        }
-    )
-
-    return latest
+    return stoch_rsi_k
 
 def calculate_rsi(symbol, interval, period=6):
-    """
-    Calcule le RSI pour une paire et un intervalle donné.
-    """
     klines = Kline.objects.filter(symbole=symbol, intervalle=interval).order_by("-timestamp")[:period + 1]
     
     if len(klines) < period + 1:
@@ -242,13 +271,15 @@ def calculate_rsi(symbol, interval, period=6):
     df = pd.DataFrame(list(klines.values("close_price")))
     df["delta"] = df["close_price"].diff()
 
-    gain = (df["delta"].where(df["delta"] > 0, 0)).rolling(window=period).mean()
-    loss = (-df["delta"].where(df["delta"] < 0, 0)).rolling(window=period).mean()
+    # Utilisation de l'EMA au lieu de la SMA
+    gain = (df["delta"].where(df["delta"] > 0, 0)).ewm(span=period, adjust=False).mean()
+    loss = (-df["delta"].where(df["delta"] < 0, 0)).ewm(span=period, adjust=False).mean()
 
     rs = gain / loss
     rsi = 100 - (100 / (1 + rs))
 
     return round(rsi.iloc[-1], 2)  # Retourne le dernier RSI calculé
+
 
 def calculate_macd(symbol, interval, short_window=12, long_window=26, signal_window=9):
     """
@@ -270,171 +301,36 @@ def calculate_macd(symbol, interval, short_window=12, long_window=26, signal_win
 
     return df.iloc[-1]["MACD"], df.iloc[-1]["Signal_Line"]
 
-def calculate_bollinger_bands(symbol, interval, window=20):
+def calculate_bollinger_bands(symbole, interval, period=20, std_dev=2):
     """
-    Calcule les bandes de Bollinger pour une paire et un intervalle donné.
+    Calcule les bandes de Bollinger pour un symbole et un intervalle donné.
+
+    Args:
+        symbole (str): Le symbole de la monnaie.
+        interval (str): L'intervalle de temps.
+        period (int): La période des Bollinger Bands.
+        std_dev (float): Le coefficient d'écart-type.
+
+    Returns:
+        tuple: (bollinger_middle, bollinger_upper, bollinger_lower)
     """
-    from core.models import Kline
-
-    klines = Kline.objects.filter(symbole=symbol, intervalle=interval).order_by("timestamp")
-
-    if len(klines) < window:
-        return None  # Pas assez de données
-
-    df = pd.DataFrame(list(klines.values("timestamp", "close_price")))
+    klines = Kline.objects.filter(symbole=symbole, intervalle=interval).order_by("-timestamp")[:period]
     
-    df["SMA"] = df["close_price"].rolling(window=window).mean()
-    df["STD"] = df["close_price"].rolling(window=window).std()
-    
-    df["Upper_Band"] = df["SMA"] + (df["STD"] * 2)
-    df["Lower_Band"] = df["SMA"] - (df["STD"] * 2)
+    if len(klines) < period:
+        print(f"⚠️ Pas assez de Klines pour calculer les Bollinger Bands ({symbole}, {interval})")
+        return None, None, None  # 🔥 Retourne 3 valeurs par sécurité
 
-    return df.iloc[-1]["Upper_Band"], df.iloc[-1]["Lower_Band"]
+    closing_prices = np.array([float(k.close_price) for k in klines[::-1]])  # Inverser pour ordre croissant
 
-def parse_condition(condition):
-    """
-    Analyse une condition sous forme de chaîne et retourne l'opérateur et la valeur.
-    """
-    print(f"🔎 Analyse de la condition : {condition}")  # Debugging
+    middle_band = np.mean(closing_prices)
+    std_dev_value = np.std(closing_prices)
 
-    for op in OPERATORS.keys():
-        if condition.startswith(op):
-            try:
-                valeur_numerique = float(condition[len(op):])  # Convertir en float après l'opérateur
-                print(f"✅ Opérateur détecté : {op}, Valeur : {valeur_numerique}")  # Debugging
-                return OPERATORS[op], valeur_numerique
-            except ValueError:
-                print(f"⚠️ Erreur de conversion dans parse_condition() : {condition}")
-                return None, None
+    upper_band = middle_band + (std_dev * std_dev_value)
+    lower_band = middle_band - (std_dev * std_dev_value)
 
-    print(f"❌ Aucune correspondance trouvée pour : {condition}")
-    return None, None
+    return middle_band, upper_band, lower_band  # 🔥 Toujours retourner 3 valeurs
 
-def check_strategy_conditions(symbole, interval, conditions):
-    """
-    Vérifie si une liste de conditions est remplie pour une monnaie donnée.
-    """
-    from core.models import Indicator  
-
-    latest_indicator = Indicator.objects.filter(symbole=symbole, intervalle=interval).order_by("-timestamp").first()
-
-    if not latest_indicator:
-        print(f"⚠️ Aucune donnée d'indicateur pour {symbole} {interval}, impossible de tester la stratégie.")
-        return False
-
-    print(f"🔍 Test de la stratégie pour {symbole} sur {interval}...")
-
-    # Vérifier si `conditions` est un bloc `AND` ou `OR`
-    if isinstance(conditions, dict) and "type" in conditions and "rules" in conditions:
-        condition_type = conditions["type"]
-        rules = conditions["rules"]
-
-        if not isinstance(rules, list):
-            print(f"⚠️ Erreur : `rules` doit être une liste mais a reçu {type(rules)} -> {rules}")
-            return False  
-
-        print(f"🔗 Bloc {condition_type} détecté...")
-
-        if condition_type == "AND":
-            if not all(check_strategy_conditions(symbole, interval, rule) for rule in rules):
-                print(f"❌ Échec d'un test AND, stratégie non validée.")
-                return False
-
-        elif condition_type == "OR":
-            if any(check_strategy_conditions(symbole, interval, rule) for rule in rules):
-                print(f"✅ Succès d'un test OR, stratégie validée.")
-                return True
-
-        return False  # Si aucune condition valide n'est trouvée
-
-    # Vérifier si `conditions` est une liste de conditions individuelles
-    if isinstance(conditions, dict) and "conditions" in conditions:
-        conditions = conditions["conditions"]
-
-    if not isinstance(conditions, list):
-        print(f"⚠️ `conditions` doit être une liste, reçu : {conditions}")
-        return False  
-
-    # 🔥 Correction : Vérifier que nous traitons bien des conditions individuelles
-    for condition in conditions:
-        if not isinstance(condition, dict):
-            print(f"⚠️ Condition ignorée (pas un dictionnaire) : {condition}")
-            continue  
-
-        # **🔥 Vérification supplémentaire : éviter de traiter des blocs `AND` et `OR` comme des conditions**
-        if "type" in condition and "rules" in condition:
-            print(f"⚠️ Ignoré : bloc {condition['type']} trouvé dans une boucle de conditions simples")
-            continue  
-
-        required_keys = ["metric", "operator", "value"]
-        missing_keys = [key for key in required_keys if key not in condition]
-
-        if missing_keys:
-            print(f"⚠️ Condition incomplète, clés manquantes : {missing_keys} dans {condition}")
-            continue  
-
-        metric = condition["metric"]
-        interval_check = condition.get("interval", interval)  
-        operator_str = condition["operator"]
-        value = condition["value"]
-
-        if interval_check != interval:
-            print(f"❌ Condition ignorée ({metric} {interval_check}), attendu {interval}")
-            continue
-
-        # Récupérer la valeur de l'indicateur
-        indicator_value = getattr(latest_indicator, metric, None)
-
-        if indicator_value is None:
-            print(f"⚠️ L'indicateur {metric} n'existe pas encore pour {symbole}")
-            return False
-
-        # Vérifier la condition
-        op_func, threshold = parse_condition(f"{operator_str}{value}")
-
-        if not op_func:
-            print(f"⚠️ Condition mal formée lors de l'analyse de l'opérateur : {condition}")
-            return False
-
-        print(f"🔹 Test {metric} = {indicator_value} {operator_str} {value} ?")
-        if not op_func(indicator_value, threshold):
-            print(f"❌ Condition non remplie : {metric} = {indicator_value}, attendu {operator_str} {value}")
-            return False  
-
-    print(f"✅ Toutes les conditions sont remplies pour {symbole} sur {interval} !")
-    return True  
-
-
-def execute_strategies(symbole):
-    """
-    Vérifie les stratégies d'achat pour un symbole donné.
-    """
-    from core.models import SymbolStrategy
-
-    strategy_obj = SymbolStrategy.objects.filter(symbole=symbole).first()
-
-    if not strategy_obj:
-        print(f"⚠️ Aucune stratégie trouvée pour {symbole}")
-        return
-
-    strategy = strategy_obj.strategy
-    if not strategy:
-        print(f"⚠️ Pas de stratégie définie pour {symbole}")
-        return
-    
-    conditions_achat = strategy.buy_conditions  
-
-    if not conditions_achat:
-        print(f"⚠️ Aucune condition d'achat définie pour {symbole}")
-        return
-
-    print(f"🔎 Test d'achat pour {symbole}")
-
-    if check_strategy_conditions(symbole, "1m", conditions_achat):
-        print(f"✅ Achat validé pour {symbole} !")
-        acheter(symbole)  
-    else:
-        print(f"❌ Achat non validé pour {symbole}.")
+import operator
 
 def get_trade_statistics():
     """
@@ -479,33 +375,102 @@ def get_trade_statistics():
 
     return stats
 
+from core.models import TradeLog
+
+MONTANT_INVESTISSEMENT_FIXE = 100.0  # Ajuste selon ton besoin
+
 def acheter(symbole):
     """
-    Simule l'achat d'une monnaie en enregistrant un trade dans la base de données.
+    Exécute un achat seulement si aucune position ouverte n'existe déjà pour cette monnaie.
     """
-    # 🔍 Récupérer le dernier prix connu de la monnaie
-    prix_achat = get_latest_price(symbole)
-    
-    if prix_achat is None:
-        print(f"❌ Impossible d'acheter {symbole} : prix non disponible !")
+    existing_trade = TradeLog.objects.filter(symbole=symbole, status="open").exists()
+    if existing_trade:
+        print(f"⚠️ Achat ignoré pour {symbole}, un trade est déjà en cours.")
         return
-    
-    # 🏦 Calculer la quantité achetée
-    quantite = INVESTMENT_AMOUNT / prix_achat
 
-    # 📌 Enregistrer le trade dans la base
+    # 🔍 Récupérer le dernier prix de la monnaie
+    last_kline = Kline.objects.filter(symbole=symbole, intervalle="1m").order_by("-timestamp").first()
+    if not last_kline or not last_kline.close_price:
+        print(f"⚠️ Pas de prix disponible pour {symbole}, achat annulé.")
+        return
+
+    last_price = last_kline.close_price
+
+    # 🔄 Déterminer le montant à investir
+    montant_investissement = MONTANT_INVESTISSEMENT_FIXE  # Peut être dynamique
+
+    # ✅ Calcul de la quantité à acheter
+    if last_price > 0:
+        quantity = montant_investissement / last_price
+    else:
+        print(f"⚠️ Impossible de calculer la quantité pour {symbole}, prix invalide.")
+        return
+
+    # 🔍 Récupérer la stratégie actuelle de la monnaie
+    monnaie = Monnaie.objects.filter(symbole=symbole).first()
+    strategy = monnaie.strategy if monnaie else None
+
+    # 🔥 Enregistrement du trade
     trade = TradeLog.objects.create(
         symbole=symbole,
-        prix_achat=prix_achat,
-        prix_max=prix_achat,  # Initialisation du prix max
+        prix_achat=last_price,
+        prix_actuel = last_price,
+        prix_max =last_price,
+        quantity=quantity,
+        investment_amount=montant_investissement,
         status="open",
-        entry_time=now(),  # Date d'achat
-        investment_amount=INVESTMENT_AMOUNT,
-        quantity=quantite,
-        strategy_json={"buy_conditions": "Exemple"}  # Tu peux mettre ici la vraie stratégie
+        strategy=monnaie.strategy if monnaie else None  # 🔄 Nouvelle relation directe
     )
 
-    print(f"🚀 Achat exécuté : {trade.symbole} | Prix: {trade.prix_achat} USDT | Quantité: {trade.quantity} | ID: {trade.id}")
+    print(f"🚀 Achat exécuté pour {symbole} à {last_price:.4f} USDT, Quantité: {quantity:.4f}, Investissement: {montant_investissement:.2f} USDT")
+
+def execute_strategies(symbole):
+    """
+    Vérifie la stratégie d'achat pour une monnaie spécifique lors de la réception d'une Kline.
+    """
+    from core.models import Monnaie
+
+    monnaie = Monnaie.objects.filter(symbole=symbole).first()
+
+    if not monnaie:
+        print(f"❌ Monnaie {symbole} introuvable.")
+        return
+
+    if not monnaie.strategy:
+        print(f"⚠️ Aucune stratégie définie pour {monnaie.symbole}, pas d'achat.")
+        return
+
+    if monnaie.strategy.evaluate_buy(monnaie.symbole):
+        print(f"✅ Achat validé pour {monnaie.symbole} selon la stratégie {monnaie.strategy.name}")
+        # Ta logique d'achat ici, par exemple :
+        acheter(monnaie.symbole)
+    else:
+        print(f"❌ Achat non validé pour {monnaie.symbole}")
+
+def execute_sell_strategy(symbole=None):
+    """
+    Vérifie les stratégies de vente et clôture les trades si nécessaire.
+    Si symbole est fourni, n'évalue que les trades de cette monnaie.
+    """
+    from core.models import TradeLog, Monnaie
+    update_trade_prices(symbole)
+
+    if symbole:
+        open_trades = TradeLog.objects.filter(status="open", symbole=symbole)
+    else:
+        open_trades = TradeLog.objects.filter(status="open")
+
+    for trade in open_trades:
+        monnaie = Monnaie.objects.get(symbole=trade.symbole)
+        if monnaie.strategy:
+            result = monnaie.strategy.evaluate_sell(trade.symbole, trade)
+            if result:
+                print(f"✅ Vente validée pour {trade.symbole} selon la stratégie {monnaie.strategy.name}")
+                trade.close_trade(trade.prix_actuel)
+                trade.status = "closed"
+                trade.save()
+            else:
+                print(f"❌ Vente non validée pour {trade.symbole}")
 
 def get_latest_price(symbole):
     """
@@ -520,113 +485,57 @@ def get_latest_price(symbole):
     
     return None  # Aucun prix trouvé
 
-def evaluate_expression(value, trade):
+def update_trade_prices(symbole=None):
     """
-    Évalue une expression en remplaçant les variables par les valeurs du trade.
-    Ex: "prix_achat * 0.999" devient "100 * 0.999"
+    Met à jour le prix actuel et le prix max pour les trades ouverts.
+    - Si un symbole est fourni, ne met à jour que ce symbole.
+    - Sinon, met à jour tous les trades ouverts.
     """
-    variables = {
-        "prix_achat": trade.prix_achat,
-        "prix_actuel": trade.prix_actuel or trade.prix_achat,  # Valeur actuelle ou prix d'achat
-        "prix_max": trade.prix_max or trade.prix_achat  # Valeur max atteinte
-    }
-    
+    trades = TradeLog.objects.filter(status="open")
+    if symbole:
+        trades = trades.filter(symbole=symbole)
+
+    for trade in trades:
+        last_kline = Kline.objects.filter(symbole=trade.symbole, intervalle="1m").order_by("-timestamp").first()
+
+        if last_kline:
+            prix_actuel = last_kline.close_price
+
+            if prix_actuel != trade.prix_actuel or prix_actuel > (trade.prix_max or 0) :
+                print(f"🔄 Mise à jour prix pour {trade.symbole} : Prix actuel {prix_actuel}, Prix max {max(prix_actuel, trade.prix_max or 0)}")
+                trade.prix_actuel = prix_actuel
+                trade.prix_max = max(prix_actuel, trade.prix_max  or 0)
+                trade.save()
+        else:
+            print(f"⚠️ Pas de Kline trouvée pour {trade.symbole}, prix non mis à jour.")
+
+def get_binance_credentials():
+    """
+    Récupère les clés API Binance depuis la base de données.
+    """
     try:
-        return eval(value, {}, variables)  # Sécurité : on n'expose que les variables permises
-    except Exception as e:
-        print(f"⚠️ Erreur lors de l'évaluation de l'expression {value}: {e}")
-        return None
-
-def check_sell_conditions(trade, conditions):
-    """
-    Vérifie si les conditions de vente sont remplies en gérant les `ET` et `OU`.
-    """
-    if not conditions:
-        return False  # Pas de condition définie
+        api_key_obj = APIKey.objects.get(name="Binance")
+        return api_key_obj.api_key, api_key_obj.secret_key
+    except APIKey.DoesNotExist:
+        print("❌ Erreur : Aucune clé API Binance trouvée dans la base !")
+        return None, None
     
-    for condition in conditions.get("conditions", []):
-        if "type" in condition and "rules" in condition:
-            if condition["type"] == "AND":
-                if not all(check_sell_conditions(trade, {"conditions": [rule]}) for rule in condition["rules"]):
-                    return False  # Un seul `False` invalide tout le bloc AND
-            elif condition["type"] == "OR":
-                if any(check_sell_conditions(trade, {"conditions": [rule]}) for rule in condition["rules"]):
-                    return True  # Un seul `True` suffit à valider un bloc OR
-            continue  # Passer aux autres conditions
-
-        metric = condition["metric"]
-        operator_str = condition["operator"]
-        value_expr = condition["value"]
-
-        if metric not in ["prix_actuel", "prix_achat", "prix_max"]:
-            print(f"⚠️ Métier inconnu : {metric}")
-            continue
-
-        # Récupérer les valeurs réelles
-        metric_value = evaluate_expression(metric, trade)
-        condition_value = evaluate_expression(value_expr, trade)
-
-        if metric_value is None or condition_value is None:
-            continue  # Impossible de comparer
-
-        op_func = OPERATORS.get(operator_str)
-        if not op_func:
-            print(f"⚠️ Opérateur inconnu : {operator_str}")
-            continue
-        
-        # Vérification de la condition
-        if op_func(metric_value, condition_value):
-            return True
-    
-    return False
-
-def execute_sell_strategy():
-    """
-    Vérifie les stratégies de vente et clôture les trades si nécessaire.
-    """
-    from core.models import TradeLog
-    from core.utils import update_trade_prices, check_strategy_conditions
-
-    # 🔄 Mise à jour des prix avant de vendre
-    update_trade_prices()
-
-    open_trades = TradeLog.objects.filter(status="open")
-
-    for trade in open_trades:
-        strategy = trade.strategy_json  # Récupère la stratégie du trade
-
-        if not strategy or "sell_conditions" not in strategy:
-            print(f"⚠️ Aucune condition de vente définie pour {trade.symbole}")
-            continue
-
-        conditions_vente = strategy["sell_conditions"]
-
-        print(f"🔎 Test de vente pour {trade.symbole} | Prix actuel: {trade.prix_actuel} | Prix achat: {trade.prix_achat} | Prix max: {trade.prix_max}")
-        print(f"🧐 Conditions de vente trouvées : {conditions_vente}")
-
-        if check_strategy_conditions(trade.symbole, "1m", conditions_vente):
-            print(f"✅ Vente validée pour {trade.symbole} | Prix actuel: {trade.prix_actuel}")
-            trade.close_trade(trade.prix_actuel)  # Ferme le trade immédiatement
-            trade.status = "closed"  # 🔥 Empêche la revente du même trade
-            trade.save()
-        else:
-            print(f"❌ Vente non validée pour {trade.symbole} | Prix actuel: {trade.prix_actuel}")
 
 
-def update_trade_prices():
-    """
-    Met à jour les prix actuels des trades ouverts en utilisant les Klines les plus récentes.
-    """
-    open_trades = TradeLog.objects.filter(status="open")
 
-    for trade in open_trades:
-        latest_kline = Kline.objects.filter(symbole=trade.symbole, intervalle="1m").order_by("-timestamp").first()
 
-        if latest_kline:
-            trade.prix_actuel = latest_kline.close_price
-            if trade.prix_max is None or trade.prix_actuel > trade.prix_max:
-                trade.prix_max = trade.prix_actuel  # Mise à jour du prix max atteint
-            trade.save()
-            print(f"🔄 Prix mis à jour : {trade.symbole} | Prix actuel: {trade.prix_actuel} | Prix max: {trade.prix_max}")
-        else:
-            print(f"⚠️ Aucune Kline récente trouvée pour {trade.symbole}, prix non mis à jour.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

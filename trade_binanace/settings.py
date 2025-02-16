@@ -59,7 +59,7 @@ ROOT_URLCONF = 'trade_binanace.urls'
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [BASE_DIR / "templates"],
+        'DIRS': [BASE_DIR / "core/templates"],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
@@ -86,6 +86,9 @@ DATABASES = {
         'PASSWORD': 'Poiuytreza@59',
         'HOST': 'localhost',
         'PORT': '5432',
+        'OPTIONS': {
+            'options': '-c client_encoding=UTF8',
+        }
     }
 }
 
