@@ -1,16 +1,54 @@
 {% extends "base.html" %}
+{% load custom_filters %}
+
 
 {% block content %}
 <div class="container mx-auto p-4">
     <h1 class="text-2xl font-bold text-center mb-4">📊 Dashboard des Monnaies</h1>
-
+    <tr hx-get="{% url 'api_dashboard' %}" hx-trigger="every 3s" hx-swap="outerHTML">
     <!-- Zone mise à jour dynamiquement avec HTMX -->
-    <div id="monnaies-container"
-         hx-get="{% url 'api_dashboard' %}" 
-         hx-trigger="load, every 1s"
-         hx-target="#monnaies-container"
-         hx-swap="innerHTML">
-        {% include "monnaies.html" %}
+    <div id="monnaies-container" hx-get="{% url 'api_dashboard' %}" hx-trigger="every 3s" hx-swap="innerHTML">
+        Chargement des données...
     </div>
+    
+    
+    
+    
+    
+    
 </div>
+<script>
+    async function fetchDashboardData() {
+        try {
+            const response = await fetch("{% url 'api_dashboard' %}");
+            const monnaies = await response.json();
+
+            // Exemple : vider le tableau et remplir avec les données reçues
+            const tbody = document.querySelector("tbody");
+            tbody.innerHTML = ""; // Vide le tableau avant remplissage
+
+            monnaies.forEach(monnaie => {
+                const row = document.createElement("tr");
+                row.innerHTML = `
+                    <td class="p-2 border border-gray-600"><a href="/api/monnaie/${monnaie.symbole}/">${monnaie.symbole}</a></td>
+                    <td class="p-2 border border-gray-600">${monnaie.prix_actuel !== null ? monnaie.prix_actuel.toFixed(4) + ' USDT' : 'N/A'}</td>
+                    <td class="p-2 border border-gray-600">${monnaie.nb_klines['1m']} (1m)</td>
+                    <td class="p-2 border border-gray-600">
+                        RSI 1m: ${monnaie.rsi_1m !== null ? monnaie.rsi_1m.toFixed(2) : '-'}<br>
+                        Stoch RSI 1m: ${monnaie.stoch_rsi_1m !== null ? monnaie.stoch_rsi_1m.toFixed(2) : '-'}<br>
+                        MACD 1m: ${monnaie.macd_1m !== null ? monnaie.macd_1m.toFixed(6) : '-'}
+                    </td>
+                `;
+                tbody.appendChild(row);
+            });
+
+        } catch (error) {
+            console.error("Erreur lors de la récupération des données:", error);
+        }
+    }
+
+    setInterval(fetchDashboardData, 3000); // Mise à jour toutes les 3 secondes
+    fetchDashboardData(); // Appel initial
+</script>
+
 {% endblock %}

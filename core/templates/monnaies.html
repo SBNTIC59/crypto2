@@ -1,67 +1,119 @@
-<table class="table-auto w-full text-left border-collapse border border-gray-600">
-    <thead>
-        <tr class="bg-gray-700 text-white">
-            <th class="p-2 border border-gray-600">Nom</th>
-            <th class="p-2 border border-gray-600">Prix Actuel</th>
-            <th class="p-2 border border-gray-600">Klines</th>
-            <th class="p-2 border border-gray-600">Indicateurs</th>
-        </tr>
-    </thead>
-    <tbody>
+{% extends 'base.html' %}
+
+{% load custom_filters %}
+
+{% block content %}
+    <h1>Liste des Monnaies</h1>
+    <table border="1" style="width:100%; border-collapse: collapse;">
+        <thead>
+            <tr>
+                <th>Symbole</th>
+                <th>Prix Actuel / Trades</th>
+                <th>Derniers Indicateurs</th>
+            </tr>
+        </thead>
+        <tbody>
         {% for monnaie in monnaies %}
-        <tr class="border border-gray-600 {% cycle 'bg-gray-800' 'bg-gray-900' %}">
-            <td class="p-2 border border-gray-600 font-bold">
-                <span style="color: {% if monnaie.init %}limegreen{% else %}red{% endif %};">
-                    {{ monnaie.symbole }}
-                </span>
-            </td>
-            <td class="p-2 border border-gray-600">
-                {% if monnaie.prix_actuel is not None %}
-                    <span class="font-bold text-green-500">{{ monnaie.prix_actuel }}</span> USDT
-                {% else %}
-                    <span class="text-gray-400">N/A</span>
-                {% endif %}
-            </td>
-            <td class="p-2 border border-gray-600">
-                {% for interval, count in monnaie.klines_count.items %}
-                    <div>{{ interval }}: {{ count }}</div>
-                {% empty %}
-                    <span class="text-gray-400">Aucune donnée</span>
-                {% endfor %}
-            </td>
-            <td class="p-2 border border-gray-600">
-                <table class="w-full border-collapse border border-gray-500">
-                    <thead>
-                        <tr class="bg-gray-600 text-white">
-                            <th class="p-1 border border-gray-500">Intervalle</th>
-                            <th class="p-1 border border-gray-500">MACD</th>
-                            <th class="p-1 border border-gray-500">RSI</th>
-                            <th class="p-1 border border-gray-500">Stoch RSI</th>
-                            <th class="p-1 border border-gray-500">Bollinger (M)</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for interval, indicateurs in monnaie.indicateurs.items %}
-                        <tr class="border border-gray-500">
-                            <td class="p-1 border border-gray-500">{{ interval }}</td>
-                            <td class="p-1 border border-gray-500">{{ indicateurs.macd|default:"-" }}</td>
-                            <td class="p-1 border border-gray-500">{{ indicateurs.rsi|default:"-" }}</td>
-                            <td class="p-1 border border-gray-500">{{ indicateurs.stoch_rsi|default:"-" }}</td>
-                            <td class="p-1 border border-gray-500">{{ indicateurs.bollinger_middle|default:"-" }}</td>
-                        </tr>
-                        {% empty %}
-                        <tr>
-                            <td colspan="5" class="text-center p-2 text-gray-400">Aucun indicateur</td>
-                        </tr>
+            <tr>
+                <td style="text-align: center;">
+                    <a href="{% url 'monnaie_detail' symbole=monnaie.symbole %}"
+                       style="color: {% if monnaie.init %}green{% else %}red{% endif %}; text-decoration: none; font-weight: bold;">
+                        {{ monnaie.symbole }}
+                    </a>
+                </td>
+                <td style="text-align: center;">
+                    <div>
+                        <strong>{{ monnaie.prix_actuel|default:"-" }}</strong>
+                    </div>
+                    <div style="margin-top: 5px;">
+                        🟢 {{ monnaie.nb_trades_win }} | 🔴 {{ monnaie.nb_trades_loss }} | ⏳ {{ monnaie.nb_trades_en_cours }}
+                    </div>
+                </td>
+                <td>
+                    <table border="1" style="width:100%; text-align: center; border-collapse: collapse;">
+                        <thead>
+                            <tr>
+                                <th>Intervalle</th>
+                                <th>Stoch RSI</th>
+                                <th>RSI</th>
+                                <th>MACD</th>
+                                <th>Bollinger M</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                        {% for interval in intervals %}
+                            <tr>
+                                <td>{{ interval }}</td>
+                                <td>{{ monnaie|getattr:'stoch_rsi_'|add:interval|default:"-"|floatformat:2 }}</td>
+                                <td>{{ monnaie|getattr:'rsi_'|add:interval|default:"-"|floatformat:2 }}</td>
+                                <td>{{ monnaie|getattr:'macd_'|add:interval|default:"-"|floatformat:6 }}</td>
+                                <td>{{ monnaie|getattr:'bollinger_middle_'|add:interval|default:"-"|floatformat:6 }}</td>
+                            </tr>
                         {% endfor %}
-                    </tbody>
-                </table>
-            </td>
-        </tr>
-        {% empty %}
-        <tr>
-            <td colspan="4" class="text-center p-4 text-gray-400">Aucune donnée disponible.</td>
-        </tr>
+                        </tbody>
+                    </table>
+                </td>
+            </tr>
         {% endfor %}
-    </tbody>
-</table>
+        </tbody>
+    </table>
+{% endblock %}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,37 @@
+{% load custom_filters %}
+<div id="stats-container" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+    <!-- Carte globale -->
+    <div class="bg-gray-800 p-4 rounded-lg shadow-md">
+        <h2 class="text-lg font-semibold mb-2">📊 Global</h2>
+        <p>Total Trades : {{ stats.total_trades }}</p>
+        <p>Trades Ouverts : {{ stats.open_trades }}</p>
+        <p>Trades Fermés : {{ stats.closed_trades }}</p>
+        <p>Trades Gagnants : {{ stats.win_trades }}</p>
+        <p>Trades Perdants : {{ stats.lose_trades }}</p>
+        <p>Gain Minimum : {{ stats.min_gain|default:'-' }}</p>
+        <p>Gain Maximum : {{ stats.max_gain|default:'-' }}</p>
+        <p>Gain Moyen : {{ stats.avg_gain|default:'-' }}</p>
+        <p>Gain Cumulé : {{ stats.cumulative_gain|default:'-' }}</p>
+        <p>Durée Minimum : {{ stats.min_duration|default:'-' }}</p>
+        <p>Durée Maximum : {{ stats.max_duration|default:'-' }}</p>
+        <p>Durée Moyenne : {{ stats.avg_duration|default:'-' }}</p>
+    </div>
+
+    <!-- Cartes par monnaie -->
+    {% for symbol, symbol_stats in stats.per_symbol.items %}
+        <div class="bg-gray-800 p-4 rounded-lg shadow-md">
+            <h2 class="text-lg font-semibold mb-2">{{ symbol }}</h2>
+            <p>Total Trades : {{ symbol_stats.total }}</p>
+            <p>Gagnants : {{ symbol_stats.win }}</p>
+            <p>Perdants : {{ symbol_stats.lose }}</p>
+            <p>Gain min : {{ symbol_stats.min_gain|format_gain|safe }}</p>
+            <p>Gain max : {{ symbol_stats.max_gain|format_gain|safe }}</p>
+            <p>Gain moyen : {{ symbol_stats.avg_gain|format_gain|safe }}</p>
+            <p>Gain cumulé : {{ symbol_stats.cumulative_gain|format_gain|safe }}</p>
+
+            
+            
+            
+        </div>
+    {% endfor %}
+</div>

@@ -1,0 +1,99 @@
+{% extends 'base.html' %}
+{% load custom_filters %}
+
+{% block content %}
+<h1 class="text-2xl font-bold mb-4">Détails pour {{ monnaie.symbole }}</h1>
+
+<p class="mb-2">Prix Actuel : <strong>{{ monnaie.prix_actuel }} USDT</strong></p>
+<p>Prix Max : {{ monnaie.prix_max }} | Prix Min : {{ monnaie.prix_min }}</p>
+<h2 class="text-xl font-semibold mt-4 mb-2">Trades</h2>
+<table class="table-auto w-full border-collapse border border-gray-600 mb-4">
+    <thead>
+        <tr class="bg-gray-700 text-white">
+            <th class="p-2 border border-gray-600">ID</th>
+            <th class="p-2 border border-gray-600">Stratégie</th>
+            <th class="p-2 border border-gray-600">Status</th>
+            <th class="p-2 border border-gray-600">Prix Achat</th>
+            <th class="p-2 border border-gray-600">Prix Actuel</th>
+            <th class="p-2 border border-gray-600">Prix Max</th>
+            <th class="p-2 border border-gray-600">Quantité</th>
+            <th class="p-2 border border-gray-600">Résultat Trade</th>
+            <th class="p-2 border border-gray-600">Entrée</th>
+            <th class="p-2 border border-gray-600">Sortie</th>
+            <th class="p-2 border border-gray-600">Durée</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for trade in trades %}
+        <tr>
+            <td class="p-2 border border-gray-600">{{ trade.id }}</td>
+            <td class="p-2 border border-gray-600">{{ trade.strategy.name }}</td>
+            <td class="p-2 border border-gray-600">{{ trade.status }}</td>
+            <td class="p-2 border border-gray-600">{{ trade.prix_achat }}</td>
+            <td class="p-2 border border-gray-600">{{ trade.prix_actuel }}</td>
+            <td class="p-2 border border-gray-600">{{ trade.prix_max }}</td>
+            <td class="p-2 border border-gray-600">{{ trade.quantity }}</td>
+            <td class="p-2 border border-gray-600">{{ trade.trade_result|default:"-" }}</td>
+            <td class="p-2 border border-gray-600">{{ trade.entry_time|date:"d-m-Y H:i:s" }}</td>
+            <td class="p-2 border border-gray-600">{{ trade.exit_time|default_if_none:"-" }}</td>
+            <td class="p-2 border border-gray-600">{{ trade.duration|default_if_none:"-" }}</td>
+        </tr>
+        {% empty %}
+        <tr>
+            <td colspan="11" class="p-2 border border-gray-600 text-center">Aucun trade disponible</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+<h2 class="text-xl font-semibold mt-4 mb-2">Indicateurs Temps Réel</h2>
+<table class="table-auto w-full border-collapse border border-gray-600">
+    <thead>
+        <tr class="bg-gray-700 text-white">
+            <th class="p-2 border border-gray-600">Intervalle</th>
+            <th class="p-2 border border-gray-600">MACD</th>
+            <th class="p-2 border border-gray-600">RSI</th>
+            <th class="p-2 border border-gray-600">Stoch RSI</th>
+            <th class="p-2 border border-gray-600">Bollinger (M)</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for interval in intervals %}
+        <tr>
+            <td class="p-2 border border-gray-600">{{ interval }}</td>
+            <td class="p-2 border border-gray-600">{{ monnaie|get_attr:"macd_"|add:interval|default:"-" }}</td>
+            <td class="p-2 border border-gray-600">{{ monnaie|get_attr:"rsi_"|add:interval|round_2|default:"-" }}</td>
+            <td class="p-2 border border-gray-600">{{ monnaie|get_attr:"stoch_rsi_"|add:interval|round_2|default:"-" }}</td>
+            <td class="p-2 border border-gray-600">{{ monnaie|get_attr:"bollinger_middle_"|add:interval|default:"-" }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<h2 class="text-xl font-semibold mt-4 mb-2">5 Dernières Klines par Intervalle</h2>
+{% for interval, klines in klines_data.items %}
+<h3 class="text-lg font-semibold mt-2">{{ interval }}</h3>
+<table class="table-auto w-full border-collapse border border-gray-600 mb-4">
+    <thead>
+        <tr class="bg-gray-700 text-white">
+            <th class="p-2 border border-gray-600">Open Time</th>
+            <th class="p-2 border border-gray-600">Open</th>
+            <th class="p-2 border border-gray-600">High</th>
+            <th class="p-2 border border-gray-600">Low</th>
+            <th class="p-2 border border-gray-600">Close</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for kline in klines %}
+        <tr>
+            <td class="p-2 border border-gray-600">{{ kline.open_time|timestamp_to_datetime }}</td>
+            <td class="p-2 border border-gray-600">{{ kline.open_price }}</td>
+            <td class="p-2 border border-gray-600">{{ kline.high_price }}</td>
+            <td class="p-2 border border-gray-600">{{ kline.low_price }}</td>
+            <td class="p-2 border border-gray-600">{{ kline.close_price }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endfor %}
+
+{% endblock %}

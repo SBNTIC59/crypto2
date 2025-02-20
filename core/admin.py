@@ -3,7 +3,7 @@ from .models import Monnaie, Strategy, TradeLog, APIKey, IndicatorTest, Calculat
 
 @admin.register(Monnaie)
 class MonnaieAdmin(admin.ModelAdmin):
-    list_display = ('symbole', 'nom', 'init', 'strategy')
+    list_display = ('symbole', 'nom', 'init', 'strategy', 'prix_actuel', 'prix_max', 'prix_min')
     list_editable = ('strategy',)
     list_filter = ('init', 'strategy')
     search_fields = ('symbole', 'nom')

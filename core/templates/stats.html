@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mx-auto p-4">
+    <h1 class="text-2xl font-bold text-center mb-4">📈 Statistiques des Trades</h1>
+
+    <!-- Zone mise à jour dynamiquement avec HTMX -->
+    <div id="stats-container"
+         hx-get="{% url 'stats_partial' %}"
+         hx-trigger="load, every 1s"
+         hx-target="#stats-container"
+         hx-swap="innerHTML">
+        {% include 'partials/stats_partial.html' %}
+    </div>
+</div>
+{% endblock %}

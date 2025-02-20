@@ -34,57 +34,65 @@ class IndicatorTest(models.Model):
         return self.name
 
     def evaluate(self, symbole, trade=None):
-        from core.models import Indicator
-
-        # 🔄 Vérifier si c'est une métrique issue de TradeLog
-        if self.indicator in ['prix_achat', 'prix_actuel', 'prix_max', 'gain_actuel']:
+        """
+        Évalue la condition de cet indicateur sur la monnaie ou le trade associé.
+        """
+        monnaie = Monnaie.objects.get(symbole=symbole)
+        # Obtenir la valeur de l'indicateur ou d'un champ spécifique du trade
+        if self.indicator in ["prix_achat", "prix_actuel", "prix_max"]:
             if not trade:
-                print(f"⚠️ [{symbole}] Pas de trade fourni pour {self.indicator}")
-                return False
+                raise ValueError(f"Le trade est requis pour évaluer l'indicateur '{self.indicator}'")
+            indicator_value = getattr(trade, self.indicator)
 
-            if self.indicator == 'prix_achat':
-                indicator_value = trade.prix_achat
-            elif self.indicator == 'prix_actuel':
-                indicator_value = trade.prix_actuel
-            elif self.indicator == 'prix_max':
-                indicator_value = trade.prix_max
-            elif self.indicator == 'gain_actuel':
-                if trade.prix_achat > 0:
-                    indicator_value = trade.prix_actuel - trade.prix_achat
-                else:
-                    indicator_value = 0
         else:
-            # Sinon, on va chercher dans les indicateurs
-            latest_indicator = Indicator.objects.filter(symbole=symbole, intervalle=self.interval).order_by('-timestamp').first()
+            indicator_field = f"{self.indicator}_{self.interval}"
+            if not hasattr(monnaie, indicator_field):
+                raise AttributeError(f"La monnaie n'a pas d'attribut {indicator_field}")
 
-            if not latest_indicator:
-                print(f"⚠️ [{symbole}] Aucun indicateur pour {self.indicator} ({self.interval})")
-                return False
+            indicator_value = getattr(monnaie, indicator_field)
 
-            indicator_value = getattr(latest_indicator, self.indicator, None)
-            if indicator_value is None:
-                print(f"⚠️ [{symbole}] Valeur manquante pour l'indicateur {self.indicator} ({self.interval})")
-                return False
-
-        # Seuil (identique à avant)
-        if self.threshold_calculation:
-            threshold = self.threshold_calculation.evaluate(trade=trade, symbole=symbole, interval=self.interval)
-            threshold_type = 'calculation'
-            print(f"🔢 [{symbole}] Threshold calculation utilisé pour {self.name} -> {self.threshold_calculation.name} = {threshold}")
-        elif self.threshold_indicator_test:
-            threshold = self.threshold_indicator_test.evaluate(symbole, trade=trade)
-            threshold_type = 'indicator_test'
-        else:
-            threshold = self.threshold_value
-            threshold_type = 'fixed'
-
-        if threshold is None:
-            print(f"❌ [{symbole}] Seuil invalide pour {self.name}")
+        # Si la valeur est None, la condition est considérée comme non valide
+        if indicator_value is None:
             return False
 
-        result = OPERATORS[self.operator](indicator_value, threshold)
-        print(f"🔎 [{symbole}] Test {self.name} : {indicator_value} {self.operator} {threshold} ({threshold_type}) -> {result}")
-        return result
+        # Obtenir la valeur du seuil
+        if self.threshold_value is not None:
+            threshold = self.threshold_value
+
+        elif self.threshold_indicator_test:
+            if self.threshold_indicator_test.indicator in ["prix_achat", "prix_actuel", "prix_max"]:
+                if not trade:
+                    raise ValueError(f"Le trade est requis pour évaluer le seuil '{self.threshold_indicator_test.indicator}'")
+                threshold = getattr(trade, self.threshold_indicator_test.indicator)
+            else:
+                threshold_field = f"{self.threshold_indicator_test.indicator}_{self.threshold_indicator_test.interval}"
+                if not hasattr(monnaie, threshold_field):
+                    raise AttributeError(f"La monnaie n'a pas d'attribut {threshold_field}")
+
+                threshold = getattr(monnaie, threshold_field)
+
+        elif self.threshold_calculation:
+            threshold = self.threshold_calculation.evaluate(monnaie, trade)
+        else:
+            raise ValueError("Aucun seuil défini pour l'indicateur.")
+
+        # Si la valeur seuil est None, la condition est considérée comme non valide
+        if threshold is None:
+            return False
+
+        # Comparaison en fonction de l'opérateur
+        if self.operator == ">":
+            return indicator_value > threshold
+        elif self.operator == "<":
+            return indicator_value < threshold
+        elif self.operator == ">=":
+            return indicator_value >= threshold
+        elif self.operator == "<=":
+            return indicator_value <= threshold
+        else:
+            raise ValueError(f"Opérateur non supporté : {self.operator}")
+    
+    
    
 
 class Calculation(models.Model):
@@ -95,7 +103,10 @@ class Calculation(models.Model):
     def __str__(self):
         return self.name
 
-    def evaluate(self, trade=None, symbole=None, interval=None):
+    def evaluate(self, symbole=None, trade=None, interval=None):
+        """
+        Évalue l'expression de la calculatrice en utilisant les valeurs de la monnaie et des trades.
+        """
         sub_results = {}
         for calc in self.sub_calculations.all():
             sub_results[calc.name] = calc.evaluate(trade, symbole, interval)
@@ -104,22 +115,28 @@ class Calculation(models.Model):
             "prix_achat": float(trade.prix_achat or 0) if trade else 0,
             "prix_actuel": float(trade.prix_actuel or trade.prix_achat or 0) if trade else 0,
             "prix_max": float(trade.prix_max or trade.prix_achat or 0) if trade else 0,
-        }       
+        }
 
         if symbole and interval:
-            from core.models import Indicator
-            latest_indicator = Indicator.objects.filter(symbole=symbole, intervalle=interval).order_by('-timestamp').first()
-            if latest_indicator:
+            from core.models import Monnaie
+            try:
+                monnaie = Monnaie.objects.get(symbole=symbole)
                 for field in ['macd', 'macd_signal', 'rsi', 'stoch_rsi', 'bollinger_upper', 'bollinger_middle', 'bollinger_lower', 'rsiComb', 'stochrsiComb']:
-                    variables[field] = getattr(latest_indicator, field, None)
+                    monnaie_field = f"{field}_{interval}"
+                    variables[field] = getattr(monnaie, monnaie_field, None)
+            except Monnaie.DoesNotExist:
+                print(f"⚠️ [Calculation] Monnaie {symbole} introuvable pour interval {interval}.")
+                return None
 
         try:
-            result = eval(self.expression, {}, variables)
-            print(f"🧮 [{symbole}] Calcul {self.name} : {self.expression} -> {result} | Variables: {variables}")
+            result = eval(self.expression, {}, {**variables, **sub_results})
+            #print(f"🧮 [{symbole}] Calcul {self.name} : {self.expression} -> {result} | Variables: {variables}")
             return result
         except Exception as e:
             print(f"❌ [{symbole}] Erreur dans le calcul {self.name} : {e}")
             return None
+ 
+    
 
 class CombinedTest(models.Model):
     name = models.CharField(max_length=100, unique=True)
@@ -148,7 +165,7 @@ class CombinedTest(models.Model):
         else:
             final_result = False
 
-        print(f"🧪 [{symbole}] CombinedTest {self.name} ({self.condition_type}) -> {final_result} | Détails: {results}")
+        #print(f"🧪 [{symbole}] CombinedTest {self.name} ({self.condition_type}) -> {final_result} | Détails: {results}")
         return final_result
     
     
@@ -175,10 +192,69 @@ class Strategy(models.Model):
         return False
 
 class Monnaie(models.Model):
-    symbole = models.CharField(max_length=20, unique=True)
+    symbole = models.CharField(max_length=20, unique=True, primary_key=True)
     nom = models.CharField(max_length=50, blank=True, null=True)
     init = models.BooleanField(default=False)
     strategy = models.ForeignKey(Strategy, null=True, blank=True, on_delete=models.SET_NULL)
+    prix_actuel = models.FloatField(null=True, blank=True)
+    prix_max = models.FloatField(null=True, blank=True)
+    prix_min = models.FloatField(null=True, blank=True)
+    stoch_rsi_1m = models.FloatField(null=True, blank=True)
+    rsi_1m = models.FloatField(null=True, blank=True)
+    macd_1m = models.FloatField(null=True, blank=True)
+    macd_signal_1m = models.FloatField(null=True, blank=True)
+    stoch_rsi_3m = models.FloatField(null=True, blank=True)
+    rsi_3m = models.FloatField(null=True, blank=True)
+    macd_3m = models.FloatField(null=True, blank=True)
+    macd_signal_3m = models.FloatField(null=True, blank=True)
+    stoch_rsi_5m = models.FloatField(null=True, blank=True)
+    rsi_5m = models.FloatField(null=True, blank=True)
+    macd_5m = models.FloatField(null=True, blank=True)
+    macd_signal_5m = models.FloatField(null=True, blank=True)
+    stoch_rsi_15m = models.FloatField(null=True, blank=True)
+    rsi_15m = models.FloatField(null=True, blank=True)
+    macd_15m = models.FloatField(null=True, blank=True)
+    macd_signal_15m = models.FloatField(null=True, blank=True)
+    stoch_rsi_1h = models.FloatField(null=True, blank=True)
+    rsi_1h = models.FloatField(null=True, blank=True)
+    macd_1h = models.FloatField(null=True, blank=True)
+    macd_signal_1h = models.FloatField(null=True, blank=True)
+    stoch_rsi_4h = models.FloatField(null=True, blank=True)
+    rsi_4h = models.FloatField(null=True, blank=True)
+    macd_4h = models.FloatField(null=True, blank=True)
+    macd_signal_4h = models.FloatField(null=True, blank=True)
+    stoch_rsi_1d = models.FloatField(null=True, blank=True)
+    rsi_1d = models.FloatField(null=True, blank=True)
+    macd_1d = models.FloatField(null=True, blank=True)
+    macd_signal_1d = models.FloatField(null=True, blank=True)
+    # Bollinger Bands
+    bollinger_middle_1m = models.FloatField(null=True, blank=True)
+    bollinger_upper_1m = models.FloatField(null=True, blank=True)
+    bollinger_lower_1m = models.FloatField(null=True, blank=True)
+
+    bollinger_middle_3m = models.FloatField(null=True, blank=True)
+    bollinger_upper_3m = models.FloatField(null=True, blank=True)
+    bollinger_lower_3m = models.FloatField(null=True, blank=True)
+
+    bollinger_middle_5m = models.FloatField(null=True, blank=True)
+    bollinger_upper_5m = models.FloatField(null=True, blank=True)
+    bollinger_lower_5m = models.FloatField(null=True, blank=True)
+
+    bollinger_middle_15m = models.FloatField(null=True, blank=True)
+    bollinger_upper_15m = models.FloatField(null=True, blank=True)
+    bollinger_lower_15m = models.FloatField(null=True, blank=True)
+
+    bollinger_middle_1h = models.FloatField(null=True, blank=True)
+    bollinger_upper_1h = models.FloatField(null=True, blank=True)
+    bollinger_lower_1h = models.FloatField(null=True, blank=True)
+
+    bollinger_middle_4h = models.FloatField(null=True, blank=True)
+    bollinger_upper_4h = models.FloatField(null=True, blank=True)
+    bollinger_lower_4h = models.FloatField(null=True, blank=True)
+
+    bollinger_middle_1d = models.FloatField(null=True, blank=True)
+    bollinger_upper_1d = models.FloatField(null=True, blank=True)
+    bollinger_lower_1d = models.FloatField(null=True, blank=True)
 
     def __str__(self):
         return self.symbole
@@ -220,7 +296,7 @@ class Indicator(models.Model):
         return f"{self.symbole} - {self.intervalle} - {self.timestamp}"
 
 class TradeLog(models.Model):
-    symbole = models.CharField(max_length=20)
+    symbole = models.ForeignKey(Monnaie, on_delete=models.CASCADE, to_field='symbole', related_name='trades')
     prix_achat = models.DecimalField(max_digits=30, decimal_places=20, default=0.00) 
     prix_actuel = models.DecimalField(max_digits=30, decimal_places=20, null=True, blank=True)
     prix_max = models.DecimalField(max_digits=30, decimal_places=20, null=True, blank=True)
