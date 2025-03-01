@@ -1,5 +1,8 @@
 from django.contrib import admin
-from .models import Monnaie, Strategy, TradeLog, APIKey, IndicatorTest, Calculation, CombinedTest
+from .models import Monnaie, Strategy, TradeLog, APIKey, IndicatorTest, Calculation, CombinedTest, RegulatorSettings
+from .utils import update_monnaie_strategy
+from django import forms
+from django.conf import settings
 
 @admin.register(Monnaie)
 class MonnaieAdmin(admin.ModelAdmin):
@@ -40,6 +43,17 @@ class MonnaieAdmin(admin.ModelAdmin):
 
     assign_strategy.short_description = "Attribuer une stratégie aux monnaies sélectionnées"
 
+    def save_model(self, request, obj, form, change):
+        """
+        Intercepte la sauvegarde pour gérer les changements de stratégie.
+        Si la stratégie est modifiée, elle met à jour la monnaie correctement.
+        """
+        if "strategy" in form.changed_data:
+            update_monnaie_strategy(obj, obj.strategy)
+        super().save_model(request, obj, form, change)
+
+
+
 @admin.register(Strategy)
 class StrategyAdmin(admin.ModelAdmin):
     list_display = ('name', 'buy_test', 'sell_test')
@@ -48,6 +62,21 @@ class StrategyAdmin(admin.ModelAdmin):
         if db_field.name in ('buy_test', 'sell_test'):
             kwargs['queryset'] = CombinedTest.objects.all().order_by('name')
         return super().formfield_for_foreignkey(db_field, request, **kwargs)
+    
+    def save_model(self, request, obj, form, change):
+        """
+        Intercepte la sauvegarde pour vérifier si la stratégie est modifiée.
+        Si elle l’est, met à jour toutes les monnaies utilisant cette stratégie.
+        """
+        super().save_model(request, obj, form, change)
+
+        if change:
+            monnaies_associees = Monnaie.objects.filter(strategy=obj)
+            for monnaie in monnaies_associees:
+                update_monnaie_strategy(monnaie, obj)
+            print(f"🔄 [UPDATE] Mise à jour des monnaies utilisant {obj.nom}")
+
+
 
 @admin.register(TradeLog)
 class TradeLogAdmin(admin.ModelAdmin):
@@ -71,3 +100,45 @@ class CalculationAdmin(admin.ModelAdmin):
 class CombinedTestAdmin(admin.ModelAdmin):
     list_display = ('name', 'condition_type')
     filter_horizontal = ('tests', 'sub_combined_tests')
+
+@admin.register(RegulatorSettings)
+class RegulatorSettingsAdmin(admin.ModelAdmin):
+    """Permet de gérer les paramètres de régulation directement depuis l'admin Django"""
+    
+    list_display = (
+        "seuil_min_traitement", "seuil_max_traitement", "seuil_critique",
+        "nb_monnaies_max", "nb_monnaies_min", "reduction_nb_monnaies"
+    )
+
+    fieldsets = (
+        ("Seuils de Régulation", {
+            "fields": ("seuil_min_traitement", "duree_surveillance_min",
+                       "seuil_max_traitement", "duree_surveillance_max",
+                       "seuil_critique", "duree_surveillance_critique")
+        }),
+        ("Nombre de Monnaies", {
+            "fields": ("nb_monnaies_max", "nb_monnaies_min", "reduction_nb_monnaies")
+        }),
+        ("Gestion des WebSockets et Queue", {
+            "fields": ("max_queue", "max_stream_per_ws", "duree_limite_ordre")
+        }),
+        ("Gestion du Flush des Klines", {
+            "fields": ("nb_messages_flush", "duree_max_flush")
+        }),
+        ("Récupération de l'historique", {
+            "fields": ("nb_klines_historique",)
+        }),
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+

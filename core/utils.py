@@ -1,7 +1,6 @@
 import requests
 import time
-from core.models import Kline, Indicator, TradeLog, APIKey, Strategy, Monnaie
-from django.db.models import Min, Max, Sum, Avg, Count
+from django.db.models import Min, Max, Sum, Avg, Count, Q, F
 from datetime import datetime, timezone
 import pandas as pd
 import threading
@@ -11,8 +10,13 @@ import decimal
 from django.utils.timezone import now
 from django.db import transaction
 import talib
+from django.conf import settings
+from collections import deque
+import random
 
-
+regul_max_atteint = False
+processing_times = deque(maxlen=100)
+is_initializing = True
 sell_conditions_lock = threading.Lock()
 OPERATORS = {
     "<": operator.lt,
@@ -52,32 +56,39 @@ def get_loaded_symbols():
     global loaded_symbols
     return loaded_symbols
 
+def init_loaded_symbols():
+    global loaded_symbols
+    loaded_symbols = {symbole: False for symbole in loaded_symbols}
+
+
+
 def get_all_usdt_pairs():
     """
     Récupère toutes les paires USDT disponibles sur Binance.
     """
+    from .models import Monnaie
     response = requests.get(BINANCE_BASE_URL_liste)
     if response.status_code == 200:
         data = response.json()
         symbols = [s["symbol"] for s in data["symbols"] if s["symbol"].endswith("USDT")]
         print(f"✅ {len(symbols)} paires USDT trouvées.")
-        return symbols
+        for symbol in symbols:
+            monnaie, created = Monnaie.objects.get_or_create(symbole=symbol)
+            if created:
+                print(f"🆕 [INFO] Monnaie {symbol} ajoutée à la base.")
+                
+        # Trier les monnaies par performance (gains cumulés et ratio de trades gagnants)
+        monnaies_triees = Monnaie.objects.filter(symbole__in=symbols).order_by(
+            -F('win_rate'),  # En premier par taux de trades gagnants
+            -F('total_profit')  # Ensuite par profit total
+            ).values_list('symbole', flat=True)
+
+        return list(monnaies_triees)      
     else:
         print(f"❌ Erreur lors de la récupération des paires Binance: {response.status_code}")
         return []
 
-#def load_historical_klines():
-#    """
-#    Charge l'historique des Klines pour toutes les paires USDT.
-#    """
-#    from core.utils import get_historical_klines
-#
-#    symbols = get_all_usdt_pairs()
-#    for symbol in symbols:
-#        print(f"🔄 Chargement des Klines pour {symbol}...")
-#        get_historical_klines(symbol, "1m")
-#
-def get_historical_klines(symbol, interval, limit=1000):
+def get_historical_klines(symbol, interval, limit=None):
     """
     Récupère l'historique des Klines depuis Binance avec gestion des erreurs.
     """
@@ -85,6 +96,10 @@ def get_historical_klines(symbol, interval, limit=1000):
     if not api_key or not secret_key:
         print("❌ Impossible de récupérer les Klines : Clés API manquantes.")
         return []
+
+    # Utilise NB_KLINES_HISTORIQUE s'il n'est pas défini en argument
+    if limit is None:
+        limit = getattr(settings, "NB_KLINES_HISTORIQUE", 100)  # Valeur par défaut si non défini
 
     headers = {"X-MBX-APIKEY": api_key}
     params = {"symbol": symbol, "interval": interval, "limit": limit}
@@ -107,29 +122,53 @@ def get_historical_klines(symbol, interval, limit=1000):
     print(f"❌ Impossible de récupérer les Klines après 3 tentatives ({symbol}, {interval}).")
     return []
 
-def load_historical_klines():
+def load_historical_klines(symbols=None):
     """
     Charge l'historique des Klines pour toutes les paires USDT et tous les intervalles nécessaires.
     """
-    symbols = get_all_usdt_pairs()
+    from core.models import Monnaie
+    global is_initializing, regul_max_atteint  # Activation du verrou
+    is_initializing = True
+    
+    if symbols is None:
+        symbols = get_all_usdt_pairs()
+    else:
+        symbols = [symbols]
+    
     intervals = ["1m", "3m", "5m", "15m", "1h", "4h", "1d"]
 
     for symbol in symbols:
-        print(f"🔄 Chargement des Klines pour {symbol}...")
-        for interval in intervals:
-            klines = get_historical_klines(symbol, interval)
-            if klines:
-                save_klines_to_db(symbol, interval, klines)
-                for interval in INTERVALS:
-                    calculate_indicators(symbol, interval)
-        Monnaie.objects.filter(symbole=symbol).update(init=True)
-        set_loaded_symbol(symbol, True)
+        monnaie = Monnaie.objects.filter(symbole=symbol).select_related("strategy").first()
+        if not monnaie or not monnaie.strategy:
+            print(f"⚠️ [WARNING] {symbol} n'a pas de stratégie assignée, aucun chargement d'historique.")
+            continue  # Passe à la monnaie suivante si aucune stratégie n'est définie
+
+        intervals = monnaie.strategy.intervals  # Récupération des intervalles utilisés par la stratégie
+        print(f"🔄 Chargement des Klines pour {symbol} (intervalles: {intervals})...")
+
+        if not regul_max_atteint:
+            for interval in intervals:
+                klines = get_historical_klines(symbol, interval)
+                if klines:
+                    save_klines_to_db(symbol, interval, klines)
+                    #for interval in INTERVALS:
+                    #    calculate_indicators(symbol, interval)
+            set_loaded_symbol(symbol, True)
+            Monnaie.objects.filter(symbole=symbol).update(init=True)
+        else:
+            set_loaded_symbol(symbol, False)
+            Monnaie.objects.filter(symbole=symbol).update(init=False)
+        
+        
         print(f"✅ Initialisation terminée pour {symbol}")
+    is_initializing = False
+    print("🔓 Régulation activée : les nouvelles monnaies peuvent être ajoutées.")    
 
 def save_klines_to_db(symbol, interval, klines):
     """
     Enregistre les Klines récupérées en base de données.
     """
+    from core.models import Kline
     klines_to_insert = [
         Kline(
             symbole=symbol,
@@ -148,57 +187,69 @@ def save_klines_to_db(symbol, interval, klines):
 
 def aggregate_higher_timeframe_klines(symbole, kline_1m):
     """
-    Met à jour les Klines des intervalles supérieurs (3m, 5m...) à partir de la dernière Kline 1m reçue.
+    Agrège les Klines 1m en intervalles supérieurs.
+    Utilise des niveaux intermédiaires pour limiter le nombre de calculs directs depuis 1m.
     """
-    intervals = {
-        "3m": 3,
-        "5m": 5,
-        "15m": 15,
-        "1h": 60,
-        "4h": 240,
-        "1d": 1440,
+    from core.models import Kline, Monnaie
+    import datetime
+    monnaie = Monnaie.objects.get(symbole=symbole)
+
+    if not monnaie.strategy:
+        print(f"⚠️ [DEBUG] {symbole} ignoré (pas de stratégie définie).")
+        return
+
+    required_intervals = set(monnaie.strategy.intervals)
+
+    INTERVAL_MAPPING = {
+        "3m": {"base": "1m", "factor": 3},  # 3x 1m
+        "5m": {"base": "1m", "factor": 5},  # 5x 1m
+        "15m": {"base": "5m", "factor": 3},  # 3x 5m (au lieu de 15x 1m)
+        "1h": {"base": "15m", "factor": 4},  # 4x 15m (au lieu de 60x 1m)
     }
 
-    timestamp_1m = kline_1m.timestamp
-    open_price_1m = kline_1m.open_price
-    high_price_1m = kline_1m.high_price
-    low_price_1m = kline_1m.low_price
-    close_price_1m = kline_1m.close_price
-    volume_1m = kline_1m.volume
+    timestamp_1m = kline_1m.timestamp  # Timestamp en ms
 
-    for interval, duration in intervals.items():
-        # Timestamp group correspondant à cette Kline 1m pour l'intervalle
-        timestamp_group = timestamp_1m - (timestamp_1m % (duration * 60 * 1000))
+    for interval, config in INTERVAL_MAPPING.items():
+        if interval in required_intervals:
+            base_interval = config["base"]
+            factor = config["factor"]
 
-        # Chercher la Kline actuelle sur cet intervalle
-        aggregated_kline, created = Kline.objects.get_or_create(
-            symbole=symbole,
-            intervalle=interval,
-            timestamp=timestamp_group,
-            defaults={
-                'open_price': open_price_1m,
-                'high_price': high_price_1m,
-                'low_price': low_price_1m,
-                'close_price': close_price_1m,
-                'volume': volume_1m,
-            }
-        )
+            # Calcul du timestamp aligné pour cet intervalle
+            timestamp_group = timestamp_1m - (timestamp_1m % (factor * 60 * 1000))
 
-        if not created:
-            # Mise à jour de la Kline si elle existait déjà (encore en cours)
-            aggregated_kline.high_price = max(aggregated_kline.high_price, high_price_1m)
-            aggregated_kline.low_price = min(aggregated_kline.low_price, low_price_1m)
-            aggregated_kline.close_price = close_price_1m
-            aggregated_kline.volume += volume_1m
-            aggregated_kline.save()
+            # Récupérer les dernières Klines du base_interval pour former cet intervalle
+            klines = Kline.objects.filter(
+                symbole=symbole, intervalle=base_interval, timestamp__gte=timestamp_group
+            ).order_by("timestamp")[:factor]
 
-        # Détecter la fin de la période pour finaliser proprement
-        next_1m_timestamp = timestamp_1m + 60 * 1000
-        next_timestamp_group = next_1m_timestamp - (next_1m_timestamp % (duration * 60 * 1000))
+            if len(klines) == factor:  # Vérifie que toutes les Klines sont disponibles
+                open_price = klines[0].open_price
+                close_price = list(klines)[-1].close_price if klines.exists() else None
+                high_price = max(k.high_price for k in klines)
+                low_price = min(k.low_price for k in klines)
+                volume = sum(k.volume for k in klines)
 
-        if next_timestamp_group != timestamp_group:
-            # On considère que la bougie précédente est clôturée
+                # Vérifier si la Kline existe déjà (évite doublons)
+                kline, created = Kline.objects.update_or_create(
+                    symbole=symbole,
+                    intervalle=interval,
+                    timestamp=timestamp_group,
+                    defaults={
+                        "open_price": open_price,
+                        "close_price": close_price,
+                        "high_price": high_price,
+                        "low_price": low_price,
+                        "volume": volume,
+                    },
+                )
+
+                if created:
+                    print(f"✅ [DEBUG] Kline {interval} créée pour {symbole} à {datetime.datetime.fromtimestamp(timestamp_group / 1000)}")
             calculate_indicators(symbole, interval)
+        #else:
+        #    print(f"⚠️ [DEBUG] Aggrégat de {symbole} ignoré pour l'interval {interval}")
+
+
 
 def calculate_indicators_with_live(symbol, interval, live_close_price):
     """
@@ -230,6 +281,7 @@ def calculate_indicators_with_live(symbol, interval, live_close_price):
 
 
 def calculate_stoch_rsi_with_current(symbol, interval, current_price=None, rsi_length=14, stoch_length=14, smooth_k=3):
+    from core.models import Kline
     klines = list(Kline.objects.filter(symbole=symbol, intervalle=interval).order_by("-timestamp")[:rsi_length + stoch_length + smooth_k])
 
     if len(klines) < (rsi_length + stoch_length + smooth_k):
@@ -276,8 +328,19 @@ def calculate_indicators(symbole, interval, kline=None, is_closed=False):
     Calcule les indicateurs techniques pour une monnaie sur un intervalle donné,
     en temps réel si la Kline n'est pas clôturée.
     """
-    monnaie = get_loaded_symbols().get(symbole)
+    from core.models import Kline, Monnaie
+    #monnaie = get_loaded_symbols().get(symbole)
+    monnaie = Monnaie.objects.get(symbole=symbole)
+    #if not isinstance(monnaie, Monnaie):  # Vérifie que c'est bien un objet Monnaie
+    #    print(f"⚠️ [WARNING] {symbole} est invalide ou non chargé correctement.")
+    #    return
+
     if not monnaie:
+        print(f"⚠️ [WARNING] {symbole} n'a pas de stratégie assignée, pas de calcul.")
+        return
+    
+    if interval not in monnaie.strategy.intervals:
+        #print(f"⚠️ [DEBUG] {symbole} {interval} ignoré (non utilisé par la stratégie).")
         return
 
     # Récupération des 14 dernières Klines (ou plus selon tes besoins pour MACD et Bollinger)
@@ -287,14 +350,7 @@ def calculate_indicators(symbole, interval, kline=None, is_closed=False):
     # Ajout de la Kline en cours si fournie (pour le calcul temps réel)
     if kline:
         klines.append(kline)
-    
-    
-    
-    
-    
-    
-    
-
+                    
     # Inversion dans le bon sens chronologique
     klines.reverse()
 
@@ -305,10 +361,33 @@ def calculate_indicators(symbole, interval, kline=None, is_closed=False):
     closes = [k.close_price for k in klines]
 
     # Calcul des indicateurs
-    rsi_value = calculate_rsi(closes)
-    stoch_rsi_value = calculate_stoch_rsi(closes)
-    macd_value, macd_signal = calculate_macd(closes)
-    bollinger_upper, bollinger_middle, bollinger_lower = calculate_bollinger_bands(closes)
+    if monnaie.strategy.use_rsi:
+        rsi_value = calculate_rsi(closes)
+    else:
+        rsi_value = None
+    
+    if monnaie.strategy.use_stoch_rsi:
+        stoch_rsi_value = calculate_stoch_rsi(closes)
+    else:
+        stoch_rsi_value = None    
+    
+    if monnaie.strategy.use_macd:
+        macd_value, macd_signal = calculate_macd(closes)
+    else:
+        macd_value, macd_signal = None, None      
+        
+
+    if monnaie.strategy.use_bollinger:
+        bollinger_upper, bollinger_middle, bollinger_lower = calculate_bollinger_bands(closes)
+    else:
+        bollinger_upper, bollinger_middle, bollinger_lower = None, None, None
+    
+    
+
+    #rsi_value = calculate_rsi(closes)
+    #stoch_rsi_value = calculate_stoch_rsi(closes)
+    #macd_value, macd_signal = calculate_macd(closes)
+    #bollinger_upper, bollinger_middle, bollinger_lower = calculate_bollinger_bands(closes)
 
     indicateurs = {
         'rsi': rsi_value,
@@ -334,18 +413,18 @@ def calculate_indicators(symbole, interval, kline=None, is_closed=False):
     
     
 
-    # Si la Kline est clôturée, on sauvegarde les indicateurs en base
-    if is_closed:
-        # Prendre le timestamp de la dernière Kline (clôturée)
-        last_timestamp = klines[-1].timestamp
-
-        # Met à jour ou crée une nouvelle entrée en base pour les indicateurs clôturés
-        Indicator.objects.update_or_create(
-            symbole=symbole,
-            intervalle=interval,
-            timestamp=last_timestamp,
-            defaults=indicateurs
-        )
+    ## Si la Kline est clôturée, on sauvegarde les indicateurs en base
+    #if is_closed:
+    #    # Prendre le timestamp de la dernière Kline (clôturée)
+    #    last_timestamp = klines[-1].timestamp
+#
+    #    # Met à jour ou crée une nouvelle entrée en base pour les indicateurs clôturés
+    #    Indicator.objects.update_or_create(
+    #        symbole=symbole,
+    #        intervalle=interval,
+    #        timestamp=last_timestamp,
+    #        defaults=indicateurs
+    #    )
 import pandas as pd
 import numpy as np
 
@@ -488,6 +567,7 @@ def acheter(symbole):
     """
     Exécute un achat seulement si aucune position ouverte n'existe déjà pour cette monnaie.
     """
+    from core.models import Kline, Monnaie
     existing_trade = TradeLog.objects.filter(symbole__symbole=symbole, status="open").exists()
     if existing_trade:
         print(f"⚠️ Achat ignoré pour {symbole}, un trade est déjà en cours.")
@@ -577,6 +657,18 @@ def execute_sell_strategy(symbole=None):
                 trade.close_trade(trade.prix_actuel)
                 trade.status = "closed"
                 trade.save()
+                monnaie.update_performance()
+                    # 📌 Récupérer les 3 derniers trades de la monnaie
+                derniers_trades = TradeLog.objects.filter(
+                    symbole=trade.symbole, status="closed"
+                    ).order_by("-close_time")[:3]
+
+                # 📌 Vérifier si ce sont **3 trades perdants consécutifs**
+                if derniers_trades.count() == 3 and all(t.trade_result < 0 for t in derniers_trades):
+                    print(f"❌ [REGULATION] Désactivation de {trade.symbole} (3 pertes d'affilée)")
+                    regulator = TradingRegulator.objects.get().first()
+                    regulator.desactiver_monnaie(trade.symbole)
+                    regulator.ajouter_monnaie()
             #else:
             #    print(f"❌ Vente non validée pour {trade.symbole}")
     
@@ -600,7 +692,7 @@ def update_trade_prices(symbole=None):
     - Si un symbole est fourni, ne met à jour que ce symbole.
     - Sinon, met à jour tous les trades ouverts.
     """
-    
+    from core.models import  Monnaie
     trades = TradeLog.objects.filter(status="open")
     
     if symbole:
@@ -639,6 +731,7 @@ def get_binance_credentials():
     """
     Récupère les clés API Binance depuis la base de données.
     """
+    from core.models import APIKey
     try:
         api_key_obj = APIKey.objects.get(name="Binance")
         return api_key_obj.api_key, api_key_obj.secret_key
@@ -646,22 +739,161 @@ def get_binance_credentials():
         print("❌ Erreur : Aucune clé API Binance trouvée dans la base !")
         return None, None
     
+def update_monnaie_strategy(monnaie, new_strategy):
+    """
+    Met à jour la stratégie d'une monnaie et ajuste son état en fonction des nouveaux besoins en indicateurs et intervalles.
+    """
+    old_intervals = set(monnaie.strategy.intervals) if monnaie.strategy else set()
+    new_intervals = set(new_strategy.intervals)
+
+    monnaie.strategy = new_strategy
+
+    # Si la nouvelle stratégie demande plus d'intervalles qu'avant, recharger l'historique
+    if new_intervals - old_intervals:
+        monnaie.init = False  # ⚠️ Nécessite un rechargement de l'historique
+        print(f"🔄 [UPDATE] {monnaie.symbole} doit être réinitialisé pour charger les nouveaux intervalles : {new_intervals - old_intervals}")
+    
+    monnaie.save()
+
+class TradingRegulator:
+    
+    def __init__(self):
+        """Initialisation des seuils et durées de surveillance"""
+        from core.models import RegulatorSettings
+        self.settings = RegulatorSettings.objects.first()  # Récupération des paramètres stockés
+        self.start_time_min = time.time()
+        self.start_time_max = time.time()
+        self.start_time_critique = time.time()
+        self.monnaies_actives = set()
+
+    def verifier_regulation(self):
+        """ Vérifie si on doit ajuster le nombre de monnaies actives """
+        maintenant = time.time()
+    
+        # 🔄 Récupération du temps de traitement min et max via `track_processing_time()`
+        temps_min, temps_max = track_processing_time()
+        nb_monnaies_actives = sum(get_loaded_symbols().values())
+        
+        print(f"📊 [DEBUG] Vérifier  Régulation : Min: {temps_min:.3f}s | Max: {temps_max:.3f}s | nombre de monnaies actives {nb_monnaies_actives}")
+        
+        
+    
+        # 📌 Vérification du SEUIL MIN : Si le temps min reste bas trop longtemps, on ajoute une monnaie
+        if (temps_min <= self.settings.seuil_min_traitement) and (temps_max <= self.settings.seuil_max_traitement):
+            if maintenant - self.start_time_min >= self.settings.duree_surveillance_min:
+                if nb_monnaies_actives < self.settings.nb_monnaies_max:
+                    self.ajouter_monnaie()
+                    self.start_time_min = maintenant  # 🔄 Reset de la durée de surveillance
+    
+        # 📌 Vérification du SEUIL MAX : Si le temps max dépasse le seuil, on réduit le nombre de monnaies
+        if temps_max >= self.settings.seuil_max_traitement:
+            if maintenant - self.start_time_max >= self.settings.duree_surveillance_max:
+                if nb_monnaies_actives > self.settings.nb_monnaies_min:
+                    self.reduire_monnaies(self.settings.reduction_nb_monnaies)
+                    self.start_time_max = maintenant  # 🔄 Reset surveillance
+    
+        # 📌 Vérification du SEUIL CRITIQUE : Si le temps max dépasse un seuil critique, on réduit encore plus
+        if temps_max >= self.settings.seuil_critique:
+            if maintenant - self.start_time_critique >= self.settings.duree_surveillance_critique:
+                if nb_monnaies_actives > self.settings.nb_monnaies_min:
+                    self.reduire_monnaies(self.settings.reduction_nb_monnaies * 2)
+                    self.start_time_critique = maintenant  # 🔄 Reset surveillance
 
 
+    def ajouter_monnaie(self):
+        """ Ajoute une nouvelle monnaie à la liste des monnaies actives """
+        from core.models import Monnaie
+        if is_initializing:
+            print("⏳ [DEBUG] Régulation en pause pour l'ajout de monnaie : Initialisation en cours...")
+            return  # Bloque l'ajout tant que l'initialisation n'est pas terminée
+        
+        global regul_max_atteint
+        regul_max_atteint= True
 
+        monnaies_disponibles = Monnaie.objects.filter(init=False).exclude(symbole__in=self.monnaies_actives).order_by("-win_rate", "-total_profit")
 
+        if monnaies_disponibles.exists():
+            nouvelle_monnaie = monnaies_disponibles.first()
+            load_historical_klines(nouvelle_monnaie.symbole)
+            
+            self.monnaies_actives.add(nouvelle_monnaie.symbole)
+            print(f"✅ [REGULATION] Nouvelle monnaie activée : {nouvelle_monnaie.symbole} | winrate: {nouvelle_monnaie.win_rate} | totalprofit :  {nouvelle_monnaie.total_profit}")
+            track_processing_time(reinit=True)
 
+    def reduire_monnaies(self, nb_a_retirer = None, critique= None,symbole = None):
+        """ Réduit le nombre de monnaies actives, en excluant celles ayant des trades en cours. """
+        from core.models import Monnaie
+        global regul_max_atteint
+        regul_max_atteint= True
+        # 📌 1. Récupérer les monnaies actives depuis `loaded_symbols`
+        
+        if critique:
+            facteur_critique = 2
+        else:
+            facteur_critique = 1
+        if not nb_a_retirer:
+            nb_a_retirer  = self.settings.reduction_nb_monnaies *facteur_critique
 
+        if not symbole:
+            monnaies_actives = [symbole for symbole, actif in get_loaded_symbols().items() if actif]
+        else:
+            monnaies_actives = [symbole]
 
+        if not monnaies_actives:
+            print("⚠️ [REGULATION] Aucune monnaie active à désactiver.")
+            return
 
+        # 📌 2. Récupérer les monnaies **sans trades en cours**
+        monnaies_sans_trades = Monnaie.objects.filter(
+                symbole__in=monnaies_actives
+            ).exclude(
+                trades__status="open"  # ⚠️ Vérifie bien le nom du related_name dans TradeLog
+            ).order_by("win_rate", "total_profit")
+          
+        
+        
 
+        if not monnaies_sans_trades:
+            print("⚠️ [REGULATION] Toutes les monnaies actives ont des trades en cours, aucune suppression possible.")
+            return
 
+        # 📌 3. Sélection des monnaies à désactiver (max `nb_a_retirer`) par performance
+        monnaies_a_retirer = monnaies_sans_trades[:nb_a_retirer]
 
+        print(f"🔍 [DEBUG] Monnaies actives avant réduction: {monnaies_actives}")
+        print(f"🔻 [REGULATION] Suppression de {len(monnaies_a_retirer)} monnaies: {monnaies_a_retirer}")
 
+        for symbole in monnaies_a_retirer:
+            #print(f"chargement liste pour reset: {symbole}")
+            monnaie = Monnaie.objects.filter(symbole=symbole).first()
+            if monnaie:
+                print(f"reset: {symbole}")
+                set_loaded_symbol(symbole, False)
+                monnaie.init = False
+                monnaie.save()
+        track_processing_time(reinit=True)
+        nb_monnaies_actives = sum(get_loaded_symbols().values())
+        print(f"✅ [REGULATION] Nombre de monnaies restantes actives : {nb_monnaies_actives}")
+    
+processing_times = []
 
+def track_processing_time(temps_traitement  = None, reinit=False):
+    """ Stocke et suit le temps de traitement des Klines """
+    global processing_times
 
-
-
-
-
-
+    if temps_traitement is not None:
+        processing_times.append(temps_traitement)
+    
+    if reinit:
+        processing_times.clear()
+        return 0,0    
+    
+    # 🔄 On conserve uniquement les 100 dernières valeurs pour éviter un stockage inutile
+    if len(processing_times) > 1000:
+        processing_times.pop(0)
+    
+    if len(processing_times) ==  0:
+        return 0,0
+    #print(f"📊 [DEBUG] Min: {min(processing_times):.3f}s | Max: {max(processing_times):.3f}s")
+    # 📊 Retourne les valeurs min et max actuelles
+    return min(processing_times), max(processing_times)

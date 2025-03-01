@@ -132,3 +132,29 @@ STATIC_URL = 'static/'
 # https://docs.djangoproject.com/en/5.1/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# ⚙️ Paramètres de Régulation des Monnaies
+SEUIL_MIN_TRAITEMENT = 0.5  # Seuil min en secondes
+DUREE_SURVEILLANCE_MIN = 30  # Durée avant d'ajouter une monnaie
+
+SEUIL_MAX_TRAITEMENT = 3.0  # Seuil max en secondes
+DUREE_SURVEILLANCE_MAX = 60  # Durée avant de réduire les monnaies
+
+SEUIL_CRITIQUE = 5.0  # Seuil critique de surcharge
+DUREE_SURVEILLANCE_CRITIQUE = 30  # Réaction plus rapide en cas de surcharge sévère
+
+NB_MONNAIES_MAX = 50  # Maximum de monnaies simultanées
+NB_MONNAIES_MIN = 5  # Minimum de monnaies actives
+REDUCTION_NB_MONNAIES = 3  # Nombre de monnaies à retirer en cas de surcharge
+
+# ⚙️ Gestion des WebSockets et Threads
+MAX_QUEUE = 10
+MAX_STREAM_PER_WS = 5
+DUREE_LIMITE_ORDRE = 2  # Temps max en secondes pour un ordre
+
+# ⚙️ Gestion du Flush des Klines
+NB_MESSAGES_FLUSH = 25
+DUREE_MAX_FLUSH = 5  # Temps max avant flush
+
+# ⚙️ Récupération de l'historique
+NB_KLINES_HISTORIQUE = 100  # Nombre de Klines à charger par intervalle
