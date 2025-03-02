@@ -153,9 +153,11 @@ def load_historical_klines(symbols=None):
                     save_klines_to_db(symbol, interval, klines)
                     #for interval in INTERVALS:
                     #    calculate_indicators(symbol, interval)
+            
             set_loaded_symbol(symbol, True)
             Monnaie.objects.filter(symbole=symbol).update(init=True)
         else:
+            
             set_loaded_symbol(symbol, False)
             Monnaie.objects.filter(symbole=symbol).update(init=False)
         
@@ -593,6 +595,8 @@ def acheter(symbole):
 
     # 🔍 Récupérer la stratégie actuelle de la monnaie
     monnaie = Monnaie.objects.filter(symbole=symbole).first()
+    print(f"monnaie dans acheter: {monnaie.symbole}")
+      
     strategy = monnaie.strategy if monnaie else None
 
     # 🔥 Enregistrement du trade
@@ -625,7 +629,7 @@ def execute_strategies(symbole):
         print(f"⚠️ Aucune stratégie définie pour {monnaie.symbole}, pas d'achat.")
         return
 
-    if monnaie.strategy.evaluate_buy(monnaie.symbole):
+    if monnaie.strategy.evaluate_buy(monnaie):
         print(f"✅ Achat validé pour {monnaie.symbole} selon la stratégie {monnaie.strategy.name}")
         # Ta logique d'achat ici, par exemple :
         acheter(monnaie.symbole)
@@ -643,15 +647,16 @@ def execute_sell_strategy(symbole=None):
     
     update_trade_prices(symbole)
     
-    if symbole:
-        open_trades = TradeLog.objects.filter(status="open", symbole__symbole=symbole)
+    if symbole is not None:
+        open_trades = TradeLog.objects.filter(status="open", symbole=symbole)
     else:
         open_trades = TradeLog.objects.filter(status="open")
 
     for trade in open_trades:
-        monnaie = Monnaie.objects.get(symbole=trade.symbole)
+        monnaie = trade.symbole
         if monnaie.strategy:
-            result = monnaie.strategy.evaluate_sell(monnaie, trade)
+            print(f"indicateur avant evaluation : stoch_rsi_1m :{monnaie.stoch_rsi_1m} | stoch_rsi_3m :{monnaie.stoch_rsi_3m} | stoch_rsi_5m :{monnaie.stoch_rsi_5m}")
+            result = monnaie.strategy.evaluate_sell(symbole=monnaie, trade=trade)
             if result:
                 print(f"✅ Vente validée pour {trade.symbole} selon la stratégie {monnaie.strategy.name}")
                 trade.close_trade(trade.prix_actuel)
@@ -785,19 +790,19 @@ class TradingRegulator:
                     self.ajouter_monnaie()
                     self.start_time_min = maintenant  # 🔄 Reset de la durée de surveillance
     
-        # 📌 Vérification du SEUIL MAX : Si le temps max dépasse le seuil, on réduit le nombre de monnaies
-        if temps_max >= self.settings.seuil_max_traitement:
-            if maintenant - self.start_time_max >= self.settings.duree_surveillance_max:
-                if nb_monnaies_actives > self.settings.nb_monnaies_min:
-                    self.reduire_monnaies(self.settings.reduction_nb_monnaies)
-                    self.start_time_max = maintenant  # 🔄 Reset surveillance
+                  
     
         # 📌 Vérification du SEUIL CRITIQUE : Si le temps max dépasse un seuil critique, on réduit encore plus
-        if temps_max >= self.settings.seuil_critique:
+        elif temps_max > self.settings.seuil_critique:
             if maintenant - self.start_time_critique >= self.settings.duree_surveillance_critique:
                 if nb_monnaies_actives > self.settings.nb_monnaies_min:
                     self.reduire_monnaies(self.settings.reduction_nb_monnaies * 2)
                     self.start_time_critique = maintenant  # 🔄 Reset surveillance
+        elif temps_max >= self.settings.seuil_max_traitement:
+            if maintenant - self.start_time_max >= self.settings.duree_surveillance_max:
+                if nb_monnaies_actives > self.settings.nb_monnaies_min:
+                    self.reduire_monnaies(self.settings.reduction_nb_monnaies)
+                    self.start_time_max = maintenant  # 🔄 Reset surveillance
 
 
     def ajouter_monnaie(self):
@@ -808,17 +813,19 @@ class TradingRegulator:
             return  # Bloque l'ajout tant que l'initialisation n'est pas terminée
         
         global regul_max_atteint
-        regul_max_atteint= True
+        regul_max_atteint= False
 
-        monnaies_disponibles = Monnaie.objects.filter(init=False).exclude(symbole__in=self.monnaies_actives).order_by("-win_rate", "-total_profit")
+        monnaies_disponibles = Monnaie.objects.filter(init=False).exclude(symbole__in=self.monnaies_actives).order_by("-win_rate", "-total_profit").values_list("symbole", flat=True)
 
         if monnaies_disponibles.exists():
             nouvelle_monnaie = monnaies_disponibles.first()
-            load_historical_klines(nouvelle_monnaie.symbole)
+            load_historical_klines(nouvelle_monnaie)
+            nb_monnaies_actives = sum(get_loaded_symbols().values())
+            self.monnaies_actives.add(nouvelle_monnaie)
+            #print(f"✅ [REGULATION] Nouvelle monnaie activée : {nouvelle_monnaie.symbole} | winrate: {nouvelle_monnaie.win_rate} | totalprofit :  {nouvelle_monnaie.total_profit}")
+            temps_min, temps_max = track_processing_time(reinit=True)
+            print(f"📊 [DEBUG] Vérifier  création monnaie : Min: {temps_min:.3f}s | Max: {temps_max:.3f}s | nombre de monnaies actives {nb_monnaies_actives}")
             
-            self.monnaies_actives.add(nouvelle_monnaie.symbole)
-            print(f"✅ [REGULATION] Nouvelle monnaie activée : {nouvelle_monnaie.symbole} | winrate: {nouvelle_monnaie.win_rate} | totalprofit :  {nouvelle_monnaie.total_profit}")
-            track_processing_time(reinit=True)
 
     def reduire_monnaies(self, nb_a_retirer = None, critique= None,symbole = None):
         """ Réduit le nombre de monnaies actives, en excluant celles ayant des trades en cours. """
@@ -848,7 +855,7 @@ class TradingRegulator:
                 symbole__in=monnaies_actives
             ).exclude(
                 trades__status="open"  # ⚠️ Vérifie bien le nom du related_name dans TradeLog
-            ).order_by("win_rate", "total_profit")
+            ).order_by("win_rate", "total_profit").values_list("symbole", flat=True)
           
         
         
@@ -864,7 +871,7 @@ class TradingRegulator:
         print(f"🔻 [REGULATION] Suppression de {len(monnaies_a_retirer)} monnaies: {monnaies_a_retirer}")
 
         for symbole in monnaies_a_retirer:
-            #print(f"chargement liste pour reset: {symbole}")
+            print(f"chargement liste pour reset: {symbole}")
             monnaie = Monnaie.objects.filter(symbole=symbole).first()
             if monnaie:
                 print(f"reset: {symbole}")

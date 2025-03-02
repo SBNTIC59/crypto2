@@ -41,7 +41,7 @@ class IndicatorTest(models.Model):
         """
         Évalue la condition de cet indicateur sur la monnaie ou le trade associé.
         """
-        monnaie = Monnaie.objects.get(symbole=symbole)
+        #monnaie = Monnaie.objects.get(symbole=symbole)
         # Obtenir la valeur de l'indicateur ou d'un champ spécifique du trade
         if self.indicator in ["prix_achat", "prix_actuel", "prix_max"]:
             if not trade:
@@ -50,10 +50,10 @@ class IndicatorTest(models.Model):
 
         else:
             indicator_field = f"{self.indicator}_{self.interval}"
-            if not hasattr(monnaie, indicator_field):
+            if not hasattr(symbole, indicator_field):
                 raise AttributeError(f"La monnaie n'a pas d'attribut {indicator_field}")
 
-            indicator_value = getattr(monnaie, indicator_field)
+            indicator_value = getattr(symbole, indicator_field)
 
         # Si la valeur est None, la condition est considérée comme non valide
         if indicator_value is None:
@@ -70,13 +70,13 @@ class IndicatorTest(models.Model):
                 threshold = getattr(trade, self.threshold_indicator_test.indicator)
             else:
                 threshold_field = f"{self.threshold_indicator_test.indicator}_{self.threshold_indicator_test.interval}"
-                if not hasattr(monnaie, threshold_field):
+                if not hasattr(symbole, threshold_field):
                     raise AttributeError(f"La monnaie n'a pas d'attribut {threshold_field}")
 
-                threshold = getattr(monnaie, threshold_field)
+                threshold = getattr(symbole, threshold_field)
 
         elif self.threshold_calculation:
-            threshold = self.threshold_calculation.evaluate(monnaie, trade)
+            threshold = self.threshold_calculation.evaluate(symbole, trade)
         else:
             raise ValueError("Aucun seuil défini pour l'indicateur.")
 
@@ -135,14 +135,12 @@ class Calculation(models.Model):
 
         if symbole and interval:
             from core.models import Monnaie
-            try:
-                monnaie = Monnaie.objects.get(symbole=symbole)
-                for field in ['macd', 'macd_signal', 'rsi', 'stoch_rsi', 'bollinger_upper', 'bollinger_middle', 'bollinger_lower', 'rsiComb', 'stochrsiComb']:
-                    monnaie_field = f"{field}_{interval}"
-                    variables[field] = getattr(monnaie, monnaie_field, None)
-            except Monnaie.DoesNotExist:
-                print(f"⚠️ [Calculation] Monnaie {symbole} introuvable pour interval {interval}.")
-                return None
+            for field in ['macd', 'macd_signal', 'rsi', 'stoch_rsi', 'bollinger_upper', 'bollinger_middle', 'bollinger_lower', 'rsiComb', 'stochrsiComb']:
+                monnaie_field = f"{field}_{interval}"
+                variables[field] = getattr(symbole, monnaie_field, None)
+            
+            
+            
 
         try:
             result = eval(self.expression, {}, {**variables, **sub_results})
@@ -234,7 +232,7 @@ class Strategy(models.Model):
 
     def evaluate_sell(self, symbole, trade):
         if self.sell_test:
-            return self.sell_test.evaluate(symbole, trade=trade)
+            return self.sell_test.evaluate(symbole=symbole, trade=trade)
         return False
     
     def update_strategy_requirements(self):
